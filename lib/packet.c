@@ -10,6 +10,7 @@
 #include "config.h"
 #include "common.h"
 #include "packet.h"
+#include "hash.h"
 
 #define IPVERSION 4
 
@@ -29,22 +30,74 @@ generate_packet(struct rte_mbuf *mbuf, int size, struct ftuple *ftuple)
     struct rte_ether_hdr *ether_hdr;
     struct rte_ipv4_hdr *ipv4_hdr;
     char *payload;
+    int header_size;
     int payload_size;
 
     ether_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr*);
-    ipv4_hdr = OBJECT_END(struct rte_ipv4_hdr*, ether_hdr);
-    payload_size = size - sizeof(*ipv4_hdr);
+    ipv4_hdr = rte_pktmbuf_mtod_offset(mbuf,
+                                       struct rte_ipv4_hdr *,
+                                       sizeof(*ether_hdr));
+    header_size = sizeof(*ether_hdr) + sizeof(*ipv4_hdr);
 
     /* Dummy ethernet src & dst, type is IPv4 */
     memset(ether_hdr, 0, sizeof(*ether_hdr));
-    ether_hdr->ether_type = RTE_ETHER_TYPE_IPV4;
+    ether_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+
+    /* Do we work with TCP? */
+    if (ftuple->ip_proto == IPPROTO_TCP) {
+        struct rte_tcp_hdr *tcp_hdr;
+        tcp_hdr = rte_pktmbuf_mtod_offset(mbuf,
+                                          struct rte_tcp_hdr *,
+                                          sizeof(*ether_hdr) +
+                                          sizeof(*ipv4_hdr));
+        header_size += sizeof(*tcp_hdr);
+        mbuf->l4_len = sizeof(*tcp_hdr);
+        tcp_hdr->src_port = ftuple->src_port;
+        tcp_hdr->dst_port = ftuple->dst_port;
+        tcp_hdr->sent_seq = 0; /* No sequence number */
+        tcp_hdr->recv_ack = 0; /* No ack number */
+        tcp_hdr->data_off = sizeof(*tcp_hdr) / 4; /* 20 Bytes header size */
+        tcp_hdr->tcp_flags = RTE_TCP_SYN_FLAG; /* Flag is always SYN */
+        tcp_hdr->rx_win = rte_cpu_to_be_16(PACKET_TCP_WINSIZE);/* Window size */
+        tcp_hdr->cksum = 0; /* Will be calculated next */
+        tcp_hdr->tcp_urp = 0; /* No urgent number */
+    } else if (ftuple->ip_proto == IPPROTO_UDP) {
+        struct rte_udp_hdr *udp_hdr;
+        udp_hdr = rte_pktmbuf_mtod_offset(mbuf,
+                                          struct rte_udp_hdr *,
+                                          sizeof(*ether_hdr) +
+                                          sizeof(*ipv4_hdr));
+        header_size += sizeof(*udp_hdr);
+        mbuf->l4_len = sizeof(*udp_hdr);
+        udp_hdr->src_port = ftuple->src_port;
+        udp_hdr->dst_port = ftuple->dst_port;
+        udp_hdr->dgram_len = rte_cpu_to_be_16(size - header_size +
+                                              sizeof(*udp_hdr));
+        udp_hdr->dgram_cksum = 0; /* Will be calculated next */
+    } else if (ftuple->ip_proto == IPPROTO_ICMP) {
+        struct rte_icmp_hdr *icmp_hdr;
+        icmp_hdr = rte_pktmbuf_mtod_offset(mbuf,
+                                          struct rte_icmp_hdr *,
+                                          sizeof(*ether_hdr) +
+                                          sizeof(*ipv4_hdr));
+        header_size += sizeof(*icmp_hdr);
+        mbuf->l4_len = sizeof(*icmp_hdr);
+        icmp_hdr->icmp_type = 8;  /* Echo (ping) */
+        icmp_hdr->icmp_code = 0;  /* N/A */
+        icmp_hdr->icmp_cksum = 0; /* Calculated later */
+        icmp_hdr->icmp_ident = 0;
+        icmp_hdr->icmp_seq_nb = 0;
+    } else {
+        printf("Error: generate_packet does not support protocol %d\n",
+               ftuple->ip_proto);
+    }
 
     /* Set IPv4 header */
     ipv4_hdr->version_ihl = IPVERSION << 4 |
                            sizeof(*ipv4_hdr) / RTE_IPV4_IHL_MULTIPLIER;
     ipv4_hdr->type_of_service = 0;  /* DSCP:0(best effort),
                                      * ECN:0(not using ECN) */
-    ipv4_hdr->total_length = rte_cpu_to_be_16(size);
+    ipv4_hdr->total_length = rte_cpu_to_be_16(size - sizeof(*ether_hdr));
     ipv4_hdr->packet_id = rte_cpu_to_be_16(1); /* Packet is not fragmented;
                                      * ID has no meaningful value
                                      * (RFC6864, sec 4.1) */
@@ -58,56 +111,24 @@ generate_packet(struct rte_mbuf *mbuf, int size, struct ftuple *ftuple)
 
     compute_ip_checksum(ipv4_hdr);
 
-    /* Do we work with TCP? */
-    if (ftuple->ip_proto == IPPROTO_TCP) {
-        struct rte_tcp_hdr *tcp_hdr;
-        tcp_hdr = OBJECT_END(struct rte_tcp_hdr*, ipv4_hdr);
-        payload = OBJECT_END(char*, tcp_hdr);
-        payload_size -= sizeof(*tcp_hdr);
-        tcp_hdr->src_port = ftuple->src_port;
-        tcp_hdr->dst_port = ftuple->dst_port;
-        tcp_hdr->sent_seq = 0; /* No sequence number */
-        tcp_hdr->recv_ack = 0; /* No ack number */
-        tcp_hdr->data_off = sizeof(*tcp_hdr) / 4; /* 20 Bytes header size */
-        tcp_hdr->tcp_flags = RTE_TCP_SYN_FLAG; /* Flag is always SYN */
-        tcp_hdr->rx_win = rte_cpu_to_be_16(PACKET_TCP_WINSIZE);/* Window size */
-        tcp_hdr->cksum = 0; /* Will be calculated next */
-        tcp_hdr->tcp_urp = 0; /* No urgent number */
-    } else if (ftuple->ip_proto == IPPROTO_UDP) {
-        struct rte_udp_hdr *udp_hdr;
-        udp_hdr = OBJECT_END(struct rte_udp_hdr*, ipv4_hdr);
-        payload = OBJECT_END(char*, udp_hdr);
-        payload_size -= sizeof(*udp_hdr);
-        udp_hdr->src_port = ftuple->src_port;
-        udp_hdr->dst_port = ftuple->dst_port;
-        udp_hdr->dgram_len = rte_cpu_to_be_16(size - sizeof(*ipv4_hdr));
-        udp_hdr->dgram_cksum = 0; /* Will be calculated next */
-    } else if (ftuple->ip_proto == IPPROTO_ICMP) {
-        struct rte_icmp_hdr *icmp_hdr;
-        icmp_hdr = OBJECT_END(struct rte_icmp_hdr*, ipv4_hdr);
-        payload = OBJECT_END(char*, icmp_hdr);
-        payload_size -= sizeof(*icmp_hdr);
-        icmp_hdr->icmp_type = 8; /* Echo (ping) */
-        icmp_hdr->icmp_code = 0; /* N/A */
-        icmp_hdr->icmp_cksum = 0; /* Calculated later */
-        icmp_hdr->icmp_ident = 0;
-        icmp_hdr->icmp_seq_nb = 0;
-    } else {
-        printf("Error: generate_packet does not support protocol %d\n",
-               ftuple->ip_proto);
-        payload = OBJECT_END(char*, ipv4_hdr);
-    }
-
-    /* Set the payload (8 bytes of timestamp) */
-    payload_size -= sizeof(long);
-    if (payload_size <= 0) {
+    /* Set the payload (8 bytes of timestamp + 2 bytes hash) */
+    payload = rte_pktmbuf_mtod_offset(mbuf,
+                                      char *,
+                                      header_size);
+    payload_size = size - header_size;
+    if (payload_size - sizeof(uint64_t) - sizeof(uint16_t) < 0) {
         printf("Error: generate_packet of size %d does not have enough "
                "space for payload data. \n", size);
     } else {
-        long timestamp = get_time_ns();
-        memcpy(payload, (char*)&timestamp, sizeof(timestamp));
-        /* Pad payload with zeros */
-        payload += sizeof(long);
+        uint64_t timestamp = get_time_ns();
+        uint16_t hash = hash_uint64(timestamp) & 0xFFFF;
+        memcpy(payload, (char*)&timestamp, sizeof(uint64_t));
+        payload+=sizeof(uint64_t);
+        payload_size-=sizeof(uint64_t);
+        memcpy(payload, (char*)&hash, sizeof(uint16_t));
+        payload+=sizeof(uint16_t);
+        payload_size-=sizeof(uint16_t);
+        /* Pad the rest of the payload with zeros */
         memset(payload, 0, payload_size);
     }
 
@@ -120,8 +141,58 @@ generate_packet(struct rte_mbuf *mbuf, int size, struct ftuple *ftuple)
         compute_icmp_checksum(ipv4_hdr);
     }
 
+    mbuf->l2_len = sizeof(*ether_hdr);
+    mbuf->l3_len = sizeof(*ipv4_hdr);
     mbuf->data_len = size;
     mbuf->pkt_len = size;
+}
+
+/* Reads a single packet from "mbuf", returns its timestamp into "timestamp".
+ * Returns 0 on valid packet. */
+int
+read_packet(struct rte_mbuf *mbuf, uint64_t *timestamp)
+{
+    struct rte_ipv4_hdr *ipv4_hdr;
+    int header_size;
+    char *payload;
+
+    header_size = sizeof(struct rte_ether_hdr);
+    ipv4_hdr = rte_pktmbuf_mtod_offset(mbuf,
+                                       struct rte_ipv4_hdr *,
+                                       header_size);
+    header_size += sizeof(struct rte_ipv4_hdr);
+
+    /* Read L4 header */
+    if (ipv4_hdr->next_proto_id == IPPROTO_TCP) {
+        header_size += sizeof(struct rte_tcp_hdr);
+    } else if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
+        header_size += sizeof(struct rte_udp_hdr);
+    } else if (ipv4_hdr->next_proto_id == IPPROTO_ICMP) {
+        header_size += sizeof(struct rte_icmp_hdr);
+    } else {
+        /* Cannot read - unknown IP protocol */
+        return READ_ERROR_UNSUPPORTED_PROTOCOL;
+    }
+
+    payload = rte_pktmbuf_mtod_offset(mbuf, char*, header_size);
+
+    /* Read timestamp and hash */
+    uint64_t ts = *(uint64_t*)payload;
+    payload += sizeof(uint64_t);
+    uint16_t hash = *(uint16_t*)payload;
+    uint16_t check = hash_uint64(ts) & 0xFFFF;
+
+    /* Check hash correcentss */
+    if (hash != check) {
+        /* Invalid packet! */
+        return READ_ERROR_HASH;
+    }
+
+    if (timestamp) {
+        *timestamp = ts;
+    }
+
+    return 0;
 }
 
 /* Compute checksum for count bytes starting at addr,

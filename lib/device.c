@@ -21,12 +21,6 @@
 #include "common.h"
 #include "device.h"
 
-typedef __uint8_t uint8_t;
-typedef __uint16_t uint16_t;
-typedef __uint32_t uint32_t;
-typedef __uint64_t uint64_t;
-
-
 static const struct rte_eth_conf port_conf_default = {
     .link_speeds = ETH_LINK_SPEED_AUTONEG,
     .rxmode = {
@@ -82,14 +76,14 @@ port_init(struct port_settings *settings)
     port_conf = port_conf_default;
     struct rte_eth_txconf txconf;
 
-    if (!rte_eth_dev_is_valid_port(settings->id)) {
+    if (!rte_eth_dev_is_valid_port(settings->port_id)) {
         return -1;
     }
 
-    retval = rte_eth_dev_info_get(settings->id, &dev_info);
+    retval = rte_eth_dev_info_get(settings->port_id, &dev_info);
     if (retval != 0) {
         printf("Error during getting device (port %u) info: %s\n",
-                settings->id, strerror(-retval));
+                settings->port_id, strerror(-retval));
         return retval;
     }
 
@@ -97,10 +91,10 @@ port_init(struct port_settings *settings)
         port_conf.txmode.offloads |= DEV_TX_OFFLOAD_MBUF_FAST_FREE;
     }
 
-    settings->socket = rte_eth_dev_socket_id(settings->id);
+    settings->socket = rte_eth_dev_socket_id(settings->port_id);
 
     /* Configure the Ethernet device. */
-    retval = rte_eth_dev_configure(settings->id,
+    retval = rte_eth_dev_configure(settings->port_id,
                                    settings->rx_queues,
                                    settings->tx_queues,
                                    &port_conf);
@@ -108,7 +102,7 @@ port_init(struct port_settings *settings)
         return retval;
     }
 
-    retval = rte_eth_dev_adjust_nb_rx_tx_desc(settings->id,
+    retval = rte_eth_dev_adjust_nb_rx_tx_desc(settings->port_id,
                                               &settings->rx_descs,
                                               &settings->tx_descs);
     if (retval != 0) {
@@ -123,7 +117,7 @@ port_init(struct port_settings *settings)
 
     /* Allocate and set up RX queues */
     for (q = 0; q < settings->rx_queues; q++) {
-        retval = rte_eth_rx_queue_setup(settings->id,
+        retval = rte_eth_rx_queue_setup(settings->port_id,
                                         q,
                                         settings->rx_descs,
                                         settings->socket,
@@ -139,7 +133,7 @@ port_init(struct port_settings *settings)
 
     /* Allocate and set up TX queues */
     for (q = 0; q < settings->tx_queues; q++) {
-        retval = rte_eth_tx_queue_setup(settings->id,
+        retval = rte_eth_tx_queue_setup(settings->port_id,
                                         q,
                                         settings->tx_descs,
                                         settings->socket,
@@ -150,22 +144,21 @@ port_init(struct port_settings *settings)
     }
 
     /* Start the Ethernet port. */
-    retval = rte_eth_dev_start(settings->id);
+    retval = rte_eth_dev_start(settings->port_id);
     if (retval < 0) {
         return retval;
     }
 
     /* Enable RX in promiscuous mode for the Ethernet device. */
-    retval = rte_eth_promiscuous_enable(settings->id);
+    retval = rte_eth_promiscuous_enable(settings->port_id);
     if (retval != 0) {
         return retval;
     }
 
     /* Display port PCI and socket */
-    const struct rte_bus *bus = dev_info.device->bus;
-    printf("Port %s with %hu RX queues (%hu descs) and %hu TX "
+    printf("Port %hu with %hu RX queues (%hu descs) and %hu TX "
            "queus (%hu descs) initialized on socket %d \n",
-           bus->name, settings->rx_queues, settings->rx_descs,
+           settings->port_id, settings->rx_queues, settings->rx_descs,
            settings->tx_queues, settings->tx_descs, settings->socket);
 
     return 0;

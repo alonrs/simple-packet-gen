@@ -1,5 +1,5 @@
-#ifndef DEVICE_H_
-#define DEVICE_H_
+#ifndef _DEVICE_H_
+#define _DEVICE_H_
 
 #include <stddef.h>
 #include <stdint.h>
@@ -9,7 +9,7 @@
 /* A single port configuration */
 struct port_settings {
     struct rte_mempool **rte_mempools;
-    uint16_t id;
+    uint16_t port_id;
     uint16_t rx_queues;
     uint16_t tx_queues;
     uint16_t rx_descs;
