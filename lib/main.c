@@ -13,6 +13,7 @@
 
 #include "config.h"
 #include "common.h"
+#include "arguments.h"
 #include "packet.h"
 #include "device.h"
 #include "generator.h"
@@ -29,6 +30,22 @@ struct worker_settings {
     uint16_t queue_index;
     uint16_t tx_queue_num;
     uint16_t rx_queue_num;
+};
+
+/* Application arguments and help.
+ * Format: name, required, is-boolean, default, help */
+static struct arguments app_args[] = {
+/* Name           R  B  Def     Help */
+{"txq",           0, 0, "4",    "Number of TX queues."},
+{"rxq",           0, 0, "4",    "Number of RX queues."},
+{"tx-descs",      0, 0, "4096", "Number of TX descs."},
+{"rx-descs",      0, 0, "4096", "Number of RX descs."},
+{"superspreader", 0, 1, NULL,   "(Policy) Generate packets using a "
+                                "superspreader policy, continuously "
+                                "increaseing dst IP and dst port."},
+{"nflows",        0, 0, "100",  "(Policy:superspreader) Number of unique flows "
+                                "for the superspreader policy."},
+{NULL,            0, 0, NULL,   "Simple DPDK client."}
 };
 
 /* Atomic messages accross cores, each a single cache line */
@@ -57,23 +74,43 @@ signal_handler(int signum)
 
 /* Parse application arguments */
 static void
-parse_args(int argc, char *argv[])
+parse_app_args(int argc, char *argv[])
 {
-    /* Initialize port configurations - TODO, from args*/
+    arg_parse(argc, argv, app_args);
+
+    /* Initialize port settings */
     memset(&tx_settings, 0, sizeof(tx_settings));
     memset(&rx_settings, 0, sizeof(rx_settings));
-    tx_settings.tx_queues = 8;
-    tx_settings.tx_descs = 4096;
+    tx_settings.tx_queues = ARG_INTEGER(app_args, "txq", 4);
+    tx_settings.tx_descs = ARG_INTEGER(app_args, "tx-descs", 4096);
     tx_settings.rx_queues = 1;
-    tx_settings.rx_descs = 512;
-    rx_settings.rx_queues = 8;
-    rx_settings.rx_descs = 4096;
+    tx_settings.rx_descs = 64;
+    rx_settings.rx_queues = ARG_INTEGER(app_args, "rxq", 4);
+    rx_settings.rx_descs = ARG_INTEGER(app_args, "rx-descs", 4096);
     rx_settings.tx_queues = 1;
-    rx_settings.tx_descs = 512;
-    worker_settings.generator = generator_policy_superspreader;
-    worker_settings.tx_queue_num = 4;
-    worker_settings.rx_queue_num = 4;
-    worker_settings.args = alloc_void_arg_uint32_t(10);
+    rx_settings.tx_descs = 64;
+    worker_settings.tx_queue_num = tx_settings.tx_queues;
+    worker_settings.rx_queue_num = rx_settings.rx_queues;
+
+    /* Set generator policy */
+    policy_t policy = POLICY_UNDEFINED;
+    if (ARG_BOOL(app_args, "superspreader", 0)) {
+        policy = POLICY_SUPERSPREADER;
+    }
+
+    if (policy == POLICY_UNDEFINED) {
+        printf("Packet generation policy was not given. Using default. \n");
+    }
+
+    switch (policy) {
+    case POLICY_SUPERSPREADER:
+    default:
+    {
+        uint32_t nflows = ARG_INTEGER(app_args, "nflows", 100);
+        printf("Using superspreader policy with %u flows. \n", nflows);
+        worker_settings.generator = generator_policy_superspreader;
+        worker_settings.args = alloc_void_arg_uint32_t(nflows);
+    }}
 }
 
 int
@@ -87,6 +124,11 @@ main(int argc, char *argv[])
     uint16_t rx_workers;
     int i;
 
+    /* Basic usage */
+    printf("Use sudo %s --help to show DPDK EAL help message. \n"
+           "Use sudo %s -- --help to show application help message. \n",
+            argv[0], argv[0]);
+
     /* Initialize the Environment Abstraction Layer (EAL). */
     int ret = rte_eal_init(argc, argv);
     if (ret < 0) {
@@ -97,7 +139,7 @@ main(int argc, char *argv[])
     argv += ret;
 
     /* Parse application argumnets */
-    parse_args(argc, argv);
+    parse_app_args(argc, argv);
 
     /* Initialize signal handler */
     atomic_init(&running.val, true);

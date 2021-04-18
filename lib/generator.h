@@ -5,6 +5,12 @@
 #include <stdint.h>
 #include "packet.h"
 
+/* Generator policy */
+typedef enum {
+    POLICY_UNDEFINED = 0,
+    POLICY_SUPERSPREADER
+} policy_t;
+
 /**
  * @brief Defines a function type for packet generators. Different packet
  * generators can generate packets based on difference policies.
