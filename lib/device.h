@@ -15,7 +15,6 @@ struct port_settings {
     uint16_t rx_descs;
     uint16_t tx_descs;
     uint32_t socket;
-    uint32_t lcore_leader;
 };
 
 int port_init(struct port_settings *settings);

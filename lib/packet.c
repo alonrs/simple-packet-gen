@@ -25,7 +25,7 @@ static void compute_icmp_checksum(struct rte_ipv4_hdr *ipv4_hdr);
 /* Fills "mbuf" with a single IPV4 packet of "size" bytes with
  * "ftuple" 5-tuple header info */
 void
-generate_packet(struct rte_mbuf *mbuf, int size, struct ftuple *ftuple)
+generate_ftuple_packet(struct rte_mbuf *mbuf, int size, struct ftuple *ftuple)
 {
     struct rte_ether_hdr *ether_hdr;
     struct rte_ipv4_hdr *ipv4_hdr;

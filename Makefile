@@ -9,7 +9,7 @@ ifeq "$(wildcard $(BIN_DIR) )" ""
 $(info Creating makefile for all object files...)
 $(shell mkdir -p $(BIN_DIR))
 $(shell $(CC) -MM $(LIB_DIR)/*.c |                              \
-sed "s/^/$(BIN_DIR)\//g" |                                      \
+sed -E "s@^(.*):@$(BIN_DIR)/\1:@g" |                            \
 awk 'NR>1&&/:/{printf "\t$$(CC) $$(CFLAGS) -o $$@ -c %s\n%s\n", \
 "$$(patsubst $(BIN_DIR)/%.o,$(LIB_DIR)/%.c,$$@)", $$0}          \
 NR==1||!/:/{print $$0}                                          \
@@ -30,7 +30,7 @@ CFLAGS +=$(shell $(PKGCONF) --cflags libdpdk)
 SOURCES:=$(wildcard $(LIB_DIR)/*.c)
 OBJECTS:=$(patsubst $(LIB_DIR)/%.c,$(BIN_DIR)/%.o,$(wildcard $(LIB_DIR)/*.c))
 
-$(BIN_DIR)/prog.exe: $(OBJECTS)
+$(BIN_DIR)/client.exe: $(OBJECTS)
 	$(CC) $(CFLAGS) $+ -o $@ $(LDFLAGS)
 
 # Include submodule with rules to create objects

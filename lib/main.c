@@ -15,21 +15,35 @@
 #include "common.h"
 #include "packet.h"
 #include "device.h"
+#include "generator.h"
 
 static int lcore_tx_worker(void *arg);
 static int lcore_rx_worker(void *arg);
+
+/* Passed to worker threads */
+struct worker_settings {
+    generator_policy_func_t generator; /* Packet generator */
+    void *args;                        /* Generator custom arguments */
+    uint16_t tx_leader_core_id;
+    uint16_t rx_leader_core_id;
+    uint16_t queue_index;
+    uint16_t tx_queue_num;
+    uint16_t rx_queue_num;
+};
 
 /* Atomic messages accross cores, each a single cache line */
 MESSAGE_T(bool, running);
 MESSAGE_T(long, tx_counter);
 MESSAGE_T(long, rx_counter);
+MESSAGE_T(long, rx_err_counter);
 
 rte_spinlock_t latency_lock;
 atomic_long latency_counter;
 atomic_long latency_total;
 
-struct port_settings tx_settings;
-struct port_settings rx_settings;
+static struct port_settings tx_settings;
+static struct port_settings rx_settings;
+static struct worker_settings worker_settings;
 
 /* Force quit on SIGINT or SIGTERM */
 static void
@@ -41,12 +55,25 @@ signal_handler(int signum)
     }
 }
 
-static inline uint16_t*
-alloc_arg(uint16_t value)
+/* Parse application arguments */
+static void
+parse_args(int argc, char *argv[])
 {
-    uint16_t *arg = (uint16_t*)malloc(sizeof(uint16_t));
-    *arg = value;
-    return arg;
+    /* Initialize port configurations - TODO, from args*/
+    memset(&tx_settings, 0, sizeof(tx_settings));
+    memset(&rx_settings, 0, sizeof(rx_settings));
+    tx_settings.tx_queues = 8;
+    tx_settings.tx_descs = 4096;
+    tx_settings.rx_queues = 1;
+    tx_settings.rx_descs = 512;
+    rx_settings.rx_queues = 8;
+    rx_settings.rx_descs = 4096;
+    rx_settings.tx_queues = 1;
+    rx_settings.tx_descs = 512;
+    worker_settings.generator = generator_policy_superspreader;
+    worker_settings.tx_queue_num = 4;
+    worker_settings.rx_queue_num = 4;
+    worker_settings.args = alloc_void_arg_uint32_t(10);
 }
 
 int
@@ -69,6 +96,9 @@ main(int argc, char *argv[])
     argc -= ret;
     argv += ret;
 
+    /* Parse application argumnets */
+    parse_args(argc, argv);
+
     /* Initialize signal handler */
     atomic_init(&running.val, true);
     signal(SIGINT, signal_handler);
@@ -77,6 +107,7 @@ main(int argc, char *argv[])
     /* Initialize counters, locks */
     atomic_init(&tx_counter.val, 0);
     atomic_init(&rx_counter.val, 0);
+    atomic_init(&rx_err_counter.val, 0);
     atomic_init(&latency_counter, 0);
     atomic_init(&latency_total, 0);
     rte_spinlock_init(&latency_lock);
@@ -89,18 +120,6 @@ main(int argc, char *argv[])
     } else if (nb_ports > 2) {
         printf("Warning: got more than two ports; using first two.\n");
     }
-
-    /* Initialize port configurations - TODO, from args*/
-    memset(&tx_settings, 0, sizeof(tx_settings));
-    memset(&rx_settings, 0, sizeof(rx_settings));
-    tx_settings.tx_queues = 4;
-    tx_settings.tx_descs = 4096;
-    tx_settings.rx_queues = 1;
-    tx_settings.rx_descs = 512;
-    rx_settings.rx_queues = 4;
-    rx_settings.rx_descs = 4096;
-    rx_settings.tx_queues = 1;
-    rx_settings.tx_descs = 512;
 
     /* Initialize first two ports. */
     i = 0;
@@ -131,10 +150,10 @@ main(int argc, char *argv[])
     /* Am I TX or RX worker */
     if (rte_socket_id() == tx_settings.socket) {
         tx_workers++;
-        tx_settings.lcore_leader = rte_lcore_id();
+        worker_settings.tx_leader_core_id = rte_lcore_id();
     } else {
         rx_workers++;
-        rx_settings.lcore_leader = rte_lcore_id();
+        worker_settings.rx_leader_core_id = rte_lcore_id();
     }
 
     /* Start workers on all cores */
@@ -143,22 +162,26 @@ main(int argc, char *argv[])
         if ((socket == tx_settings.socket) &&
             (tx_workers < tx_settings.tx_queues)) {
             printf ("Starting TX worker on core %d\n", lcore_id);
-            rte_eal_remote_launch(lcore_tx_worker,
-                                  alloc_arg(tx_workers),
-                                  lcore_id);
             if (tx_workers == 0) {
-                tx_settings.lcore_leader = lcore_id;
+                worker_settings.tx_leader_core_id = lcore_id;
             }
+            worker_settings.queue_index = tx_workers;
+            rte_eal_remote_launch(lcore_tx_worker,
+                                  alloc_void_arg_bytes(&worker_settings,
+                                                       sizeof(worker_settings)),
+                                  lcore_id);
             tx_workers++;
         } else if ((socket == rx_settings.socket) &&
                    (rx_workers < rx_settings.rx_queues)) {
             printf ("Starting RX worker on core %d\n", lcore_id);
-            rte_eal_remote_launch(lcore_rx_worker,
-                                  alloc_arg(rx_workers),
-                                  lcore_id);
             if (rx_workers == 0) {
-                rx_settings.lcore_leader = lcore_id;
+                worker_settings.rx_leader_core_id = lcore_id;
             }
+            worker_settings.queue_index = rx_workers;
+            rte_eal_remote_launch(lcore_rx_worker,
+                                  alloc_void_arg_bytes(&worker_settings,
+                                                       sizeof(worker_settings)),
+                                  lcore_id);
             rx_workers++;
         }
     }
@@ -166,10 +189,12 @@ main(int argc, char *argv[])
     /* Am I TX or RX worker */
     if (rte_socket_id() == tx_settings.socket) {
         printf ("Starting TX worker on core %d\n", rte_lcore_id());
-        lcore_tx_worker(alloc_arg(0));
+        lcore_tx_worker(alloc_void_arg_bytes(&worker_settings,
+                                             sizeof(worker_settings)));
     } else {
         printf ("Starting RX worker on core %d\n", rte_lcore_id());
-        lcore_rx_worker(alloc_arg(0));
+        lcore_rx_worker(alloc_void_arg_bytes(&worker_settings,
+                                             sizeof(worker_settings)));
     }
 
     return 0;
@@ -179,19 +204,23 @@ main(int argc, char *argv[])
 static int
 lcore_tx_worker(void *arg)
 {
+    struct worker_settings worker_settings;
     struct rte_mempool *rte_mempool;
     struct rte_mbuf *rte_mbufs[PACKET_BATCH];
     struct ftuple ftuple;
-    uint16_t queue_id;
     uint16_t retval;
     uint64_t last_ns;
+    uint64_t pkt_counter;
     double diff_ns;
     int socket, core;
 
-    queue_id = *(uint16_t*)arg;
-    free(arg);
+    get_void_arg_bytes(&worker_settings,
+                       arg,
+                       sizeof(worker_settings));
     socket = rte_socket_id();
     core = rte_lcore_id();
+    pkt_counter = 0;
+    last_ns = get_time_ns();
 
     /* Allocate memory */
     rte_mempool = create_mempool(socket, DEVICE_MEMPOOL_TX_ELEMENTS);
@@ -200,25 +229,22 @@ lcore_tx_worker(void *arg)
         rte_exit(EXIT_FAILURE, "Failed to allocate mbuf \n");
     }
 
-    /* Dummy 5-tuple */
-    ftuple.ip_proto = IPPROTO_TCP;
-    ftuple.src_ip = get_ip_address(192,168,0,1);
-    ftuple.dst_ip = get_ip_address(192,168,0,10);
-    ftuple.src_port = get_port(100);
-    ftuple.dst_port = get_port(80);
-
-    last_ns = get_time_ns();
-
     while(running.val) {
 
         /* Generate packet batch based on the 5-tuple */
         for (int i=0; i<PACKET_BATCH; i++) {
-            generate_packet(rte_mbufs[i], PACKET_SIZE, &ftuple);
+            worker_settings.generator(pkt_counter,
+                                      worker_settings.queue_index,
+                                      worker_settings.tx_queue_num,
+                                      &ftuple,
+                                      worker_settings.args);
+            generate_ftuple_packet(rte_mbufs[i], PACKET_SIZE, &ftuple);
+            pkt_counter++;
         }
 
         /* Send packets */
         retval = rte_eth_tx_burst(tx_settings.port_id,
-                                  queue_id,
+                                  worker_settings.queue_index,
                                   rte_mbufs,
                                   PACKET_BATCH);
 
@@ -228,12 +254,12 @@ lcore_tx_worker(void *arg)
         }
 
         /* Leader prints to screen */
-        if (core == tx_settings.lcore_leader) {
+        if (core == worker_settings.tx_leader_core_id) {
             diff_ns = get_time_ns() - last_ns;
             if (diff_ns > 1e9) {
                 long counter = atomic_exchange(&tx_counter.val, 0);
                 double mpps = (double)counter/1e6/(diff_ns/1e9);
-                printf("TX %.3lf Mpps\n", mpps);
+                printf("TX %.4lf Mpps\n", mpps);
                 last_ns = get_time_ns();
             }
         }
@@ -247,45 +273,52 @@ static int
 lcore_rx_worker(void *arg)
 {
     struct rte_mbuf *rte_mbufs[PACKET_BATCH];
-    uint16_t queue_id;
+    struct worker_settings worker_settings;
     uint16_t packets;
     uint64_t last_ns, latency_ns, diff_ns;
     uint64_t timestamp;
     long diff_counter, diff_total;
     int core;
     int retval;
+    long counter, err_counter;
 
-    queue_id = *(uint16_t*)arg;
-    free(arg);
+    get_void_arg_bytes(&worker_settings,
+                       arg,
+                       sizeof(worker_settings));
     core = rte_lcore_id();
-
     last_ns = get_time_ns();
 
     while(running.val) {
 
         /* Get a batch of packets */
         packets = rte_eth_rx_burst(rx_settings.port_id,
-                                   queue_id,
+                                   worker_settings.queue_index,
                                    rte_mbufs,
                                    PACKET_BATCH);
 
-        /* Update RX counter */
-        if (packets > 0) {
-            atomic_fetch_add(&rx_counter.val, packets);
-        }
-
         diff_total = 0;
         diff_counter = 0;
+        err_counter = 0;
         latency_ns = get_time_ns();
 
         /* Check timestamps, update latency, free memory */
         for (uint16_t i=0; i<packets; i++) {
             retval = read_packet(rte_mbufs[i], &timestamp);
-            if (!retval) {
+            if (retval) {
+                err_counter++;
+            } else {
                 diff_total += (latency_ns - timestamp);
                 diff_counter++;
             }
             rte_pktmbuf_free(rte_mbufs[i]);
+        }
+
+        /* Update RX counters */
+        if (packets > 0) {
+            atomic_fetch_add(&rx_counter.val, packets);
+        }
+        if (err_counter > 0) {
+            atomic_fetch_add(&rx_err_counter.val, err_counter);
         }
 
         /* Update latency counters */
@@ -297,21 +330,25 @@ lcore_rx_worker(void *arg)
         }
 
         /* Leader prints to screen */
-        if (core == rx_settings.lcore_leader) {
+        if (core == worker_settings.rx_leader_core_id) {
             diff_ns = get_time_ns() - last_ns;
             if (diff_ns > 1e9) {
-                long counter = atomic_exchange(&rx_counter.val, 0);
-                double mpps = (double)counter/1e6/(diff_ns/1e9);
 
+                /* Calculate RX, RX errors */
+                counter = atomic_exchange(&rx_counter.val, 0);
+                double mpps = (double)counter/1e6/(diff_ns/1e9);
+                err_counter = atomic_exchange(&rx_err_counter.val, 0);
+
+                /* Calc avg latency */
                 rte_spinlock_lock(&latency_lock);
-                diff_total = atomic_load(&latency_total);
-                diff_counter = atomic_load(&latency_counter);
+                diff_total = atomic_exchange(&latency_total, 0);
+                diff_counter = atomic_exchange(&latency_counter, 0);
                 double avg_latency_usec = (diff_counter == 0) ? 0 :
                         (double)diff_total / diff_counter / 1e3;
                 rte_spinlock_unlock(&latency_lock);
 
-                printf("RX %.3lf Mpps, avg. latency %.1lf usec\n",
-                       mpps, avg_latency_usec);
+                printf("RX %.4lf Mpps, errors: %lu, avg. latency %.1lf usec\n",
+                       mpps, err_counter, avg_latency_usec);
                 last_ns = get_time_ns();
             }
         }
