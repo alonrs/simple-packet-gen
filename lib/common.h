@@ -38,10 +38,12 @@ alloc_void_arg_uint32_t(uint32_t value)
 }
 
 static inline uint32_t
-get_void_arg_uint32_t(void* arg)
+get_void_arg_uint32_t(void* arg, bool del)
 {
     uint32_t ret = *(uint32_t*)arg;
-    free(arg);
+    if (del) {
+        free(arg);
+    }
     return ret;
 }
 
@@ -54,10 +56,12 @@ alloc_void_arg_bytes(void *ptr, size_t size)
 }
 
 static inline void
-get_void_arg_bytes(void* dst, void* arg, size_t size)
+get_void_arg_bytes(void* dst, void* arg, size_t size, bool del)
 {
     memcpy(dst, arg, size);
-    free(arg);
+    if (del) {
+        free(arg);
+    }
 }
 
 #endif

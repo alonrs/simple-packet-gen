@@ -16,7 +16,7 @@ generator_policy_superspreader(uint64_t pkt_num,
 
     /* First packet */
     if (!pkt_num) {
-        nflows = get_void_arg_uint32_t(args);
+        nflows = get_void_arg_uint32_t(args, false);
         ftuple->ip_proto = IPPROTO_TCP;
         ftuple->src_ip = get_ip_address(192,168,0,1);
         ftuple->dst_ip = get_ip_address(192,168,0,10);

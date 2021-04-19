@@ -270,7 +270,8 @@ lcore_tx_worker(void *arg)
 
     get_void_arg_bytes(&worker_settings,
                        arg,
-                       sizeof(worker_settings));
+                       sizeof(worker_settings),
+                       true);
     socket = rte_socket_id();
     core = rte_lcore_id();
     pkt_counter = 0;
@@ -338,7 +339,8 @@ lcore_rx_worker(void *arg)
 
     get_void_arg_bytes(&worker_settings,
                        arg,
-                       sizeof(worker_settings));
+                       sizeof(worker_settings),
+                       true);
     core = rte_lcore_id();
     last_ns = get_time_ns();
 
