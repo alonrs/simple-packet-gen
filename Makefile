@@ -1,7 +1,7 @@
 LIB_DIR ?= lib
 BIN_DIR ?= bin
 CC      ?= gcc
-CFLAGS  ?= -std=gnu11 -Wall -O2 -g
+CFLAGS  ?= -std=gnu11 -Wall -g
 PKGCONF ?= pkg-config
 
 # Create bin directory and make submodule
@@ -30,11 +30,18 @@ CFLAGS +=$(shell $(PKGCONF) --cflags libdpdk)
 SOURCES:=$(wildcard $(LIB_DIR)/*.c)
 OBJECTS:=$(patsubst $(LIB_DIR)/%.c,$(BIN_DIR)/%.o,$(wildcard $(LIB_DIR)/*.c))
 
+release: $(BIN_DIR)/client.exe
+debug:   $(BIN_DIR)/client.exe
+
 $(BIN_DIR)/client.exe: $(OBJECTS)
 	$(CC) $(CFLAGS) $+ -o $@ $(LDFLAGS)
 
 # Include submodule with rules to create objects
 include $(BIN_DIR)/objects.mk
+
+# Target specific variables
+release: CFLAGS += -O2 -DNDEBUG
+debug:   CFLAGS += -O0
 
 clean:
 	rm -rf $(BIN_DIR)
