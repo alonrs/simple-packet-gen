@@ -40,6 +40,8 @@ static struct arguments app_args[] = {
 {"rxq",           0, 0, "4",    "Number of RX queues."},
 {"tx-descs",      0, 0, "4096", "Number of TX descs."},
 {"rx-descs",      0, 0, "4096", "Number of RX descs."},
+{"xstats",        0, 1, NULL,   "Show port xstats at the end."},
+{"hide-zeros",    0, 1, NULL,   "(xstats) Hide zero values."},
 {"superspreader", 0, 1, NULL,   "(Policy) Generate packets using a "
                                 "superspreader policy, continuously "
                                 "increaseing dst IP and dst port."},
@@ -173,6 +175,7 @@ main(int argc, char *argv[])
                          "Cannot init port %" PRIu16 "\n",
                          portid);
             }
+            port_get_status(portid);
         } else if (i == 1) {
             rx_settings.port_id = portid;
             if (port_init(&rx_settings) != 0) {
@@ -180,6 +183,7 @@ main(int argc, char *argv[])
                          "Cannot init port %" PRIu16 "\n",
                          portid);
             }
+            port_get_status(portid);
         } else {
             break;
         }
@@ -237,6 +241,14 @@ main(int argc, char *argv[])
         printf ("Starting RX worker on core %d\n", rte_lcore_id());
         lcore_rx_worker(alloc_void_arg_bytes(&worker_settings,
                                              sizeof(worker_settings)));
+    }
+
+    /* Show xstats. Will get here after signal */
+    bool xstats = ARG_BOOL(app_args, "xstats", false);
+    bool hide_zeros = ARG_BOOL(app_args, "hide-zeros", false);
+    if (xstats) {
+        port_xstats_display(tx_settings.port_id, hide_zeros);
+        port_xstats_display(rx_settings.port_id, hide_zeros);
     }
 
     return 0;

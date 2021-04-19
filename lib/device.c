@@ -10,6 +10,7 @@
 #include <rte_byteorder.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
+#include <rte_ethdev.h>
 #include <rte_cycles.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
@@ -162,4 +163,87 @@ port_init(struct port_settings *settings)
            settings->tx_queues, settings->tx_descs, settings->socket);
 
     return 0;
+}
+
+void
+port_get_status(uint16_t port_id)
+{
+    struct rte_eth_link link;
+    int retval;
+
+    printf("Getting port %hu status... ", port_id);
+    retval = rte_eth_link_get(port_id, &link);
+
+    if (retval) {
+        printf("error \n");
+        return;
+    }
+
+    const char *dp = (link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
+                     "full-duplex" : "half-duplex";
+
+    printf("link %s, speed %s - %s\n",
+           link.link_status ? "up" : "down",
+           rte_eth_link_speed_to_str(link.link_speed),
+           dp);
+}
+
+/* Taken from testpmd - show xstats */
+void
+port_xstats_display(uint16_t port_id, bool hide_zeros)
+{
+    struct rte_eth_xstat *xstats;
+    int cnt_xstats, idx_xstat;
+    struct rte_eth_xstat_name *xstats_names;
+
+    printf("###### NIC extended statistics for port %-2d\n", port_id);
+    if (!rte_eth_dev_is_valid_port(port_id)) {
+        printf("Error: Invalid port number %i\n", port_id);
+        return;
+    }
+
+    /* Get count */
+    cnt_xstats = rte_eth_xstats_get_names(port_id, NULL, 0);
+    if (cnt_xstats  < 0) {
+        printf("Error: Cannot get count of xstats\n");
+        return;
+    }
+
+    /* Get id-name lookup table */
+    xstats_names = malloc(sizeof(struct rte_eth_xstat_name) * cnt_xstats);
+    if (xstats_names == NULL) {
+        printf("Cannot allocate memory for xstats lookup\n");
+        return;
+    }
+    if (cnt_xstats != rte_eth_xstats_get_names(
+            port_id, xstats_names, cnt_xstats)) {
+        printf("Error: Cannot get xstats lookup\n");
+        free(xstats_names);
+        return;
+    }
+
+    /* Get stats themselves */
+    xstats = malloc(sizeof(struct rte_eth_xstat) * cnt_xstats);
+    if (xstats == NULL) {
+        printf("Cannot allocate memory for xstats\n");
+        free(xstats_names);
+        return;
+    }
+    if (cnt_xstats != rte_eth_xstats_get(port_id, xstats, cnt_xstats)) {
+        printf("Error: Unable to get xstats\n");
+        free(xstats_names);
+        free(xstats);
+        return;
+    }
+
+    /* Display xstats */
+    for (idx_xstat = 0; idx_xstat < cnt_xstats; idx_xstat++) {
+        if (hide_zeros && !xstats[idx_xstat].value)
+            continue;
+        printf("%s: %"PRIu64"\n",
+            xstats_names[idx_xstat].name,
+            xstats[idx_xstat].value);
+    }
+    free(xstats_names);
+    free(xstats);
 }

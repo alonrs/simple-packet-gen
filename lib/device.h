@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #include <rte_mbuf.h>
 
@@ -18,6 +19,10 @@ struct port_settings {
 };
 
 int port_init(struct port_settings *settings);
+
+void port_get_status(uint16_t port_id);
+
+void port_xstats_display(uint16_t port_id, bool hide_zeros);
 
 /* Create a mempool of "size" bytes on "socket" */
 struct rte_mempool* create_mempool(int socket, int size);
