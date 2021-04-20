@@ -18,9 +18,18 @@ END{printf "\t$$(CC) $$(CFLAGS) -c -o $$@ %s\n",                \
 > $(BIN_DIR)/objects.mk)
 endif
 
+# Is DPDK installed on ./dpdk/build/install?
+ifeq "$(wildcard ./dpdk/build/install )" ""
+$(error "You must run build.sh before make.")
+endif
+
+# Set package config path to dkd install dir
+PCFILES=$(shell find $(PWD)/dpdk/build/install/ -name "*.pc")
+export PKG_CONFIG_PATH=$(shell dirname $(PCFILES) | sort | uniq)
+
 # Build using pkg-config variables if possible
 ifneq ($(shell $(PKGCONF) --exists libdpdk && echo 0),0)
-$(error "no installation of DPDK found")
+$(error "No installation of DPDK found. Did you run build.sh?")
 endif
 
 LDFLAGS:=$(shell $(PKGCONF) --static --libs libdpdk)
