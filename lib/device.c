@@ -22,10 +22,6 @@
 #include "common.h"
 #include "device.h"
 
-static const struct rte_eth_conf port_conf_default = {
-    .link_speeds = ETH_LINK_SPEED_AUTONEG,
-};
-
 /* Create a mempool of "size" bytes on "socket" */
 struct rte_mempool*
 create_mempool(int socket, int size) {
@@ -35,7 +31,7 @@ create_mempool(int socket, int size) {
 
     sprintf(pool_name, "mempool-%d", __sync_fetch_and_add(&counter, 1));
     rte_mempool = rte_pktmbuf_pool_create(pool_name,
-                                          DEVICE_MEMPOOL_RX_ELEMENTS,
+                                          DEVICE_MEMPOOL_RX_ELEMENTS-1,
                                           DEVICE_MEMPOOL_CACHE_SIZE,
                                           0,
                                           size + RTE_PKTMBUF_HEADROOM,
@@ -67,12 +63,11 @@ int
 port_init(struct port_settings *settings)
 {
     struct rte_eth_dev_info dev_info;
-    struct rte_eth_conf port_conf;
+    struct rte_eth_conf port_conf = {};
+    struct rte_eth_rxconf rx_conf = {};
+    struct rte_eth_txconf tx_conf = {};
     int retval;
     uint16_t q;
-
-    port_conf = port_conf_default;
-    struct rte_eth_txconf txconf;
 
     if (!rte_eth_dev_is_valid_port(settings->port_id)) {
         return -1;
@@ -103,6 +98,18 @@ port_init(struct port_settings *settings)
         return retval;
     }
 
+    /* Allocate and set up TX queues */
+    for (q = 0; q < settings->tx_queues; q++) {
+        retval = rte_eth_tx_queue_setup(settings->port_id,
+                                        q,
+                                        settings->tx_descs,
+                                        settings->socket,
+                                        &tx_conf);
+        if (retval < 0) {
+            return retval;
+        }
+    }
+
     /* Allocate memory pools per RX queue */
     if (settings->rx_queues) {
         settings->rte_mempools = create_mempools(settings->rx_queues,
@@ -115,23 +122,8 @@ port_init(struct port_settings *settings)
                                         q,
                                         settings->rx_descs,
                                         settings->socket,
-                                        NULL,
+                                        &rx_conf,
                                         settings->rte_mempools[q]);
-        if (retval < 0) {
-            return retval;
-        }
-    }
-
-    txconf = dev_info.default_txconf;
-    txconf.offloads = port_conf.txmode.offloads;
-
-    /* Allocate and set up TX queues */
-    for (q = 0; q < settings->tx_queues; q++) {
-        retval = rte_eth_tx_queue_setup(settings->port_id,
-                                        q,
-                                        settings->tx_descs,
-                                        settings->socket,
-                                        &txconf);
         if (retval < 0) {
             return retval;
         }
@@ -181,9 +173,9 @@ port_get_status(uint16_t port_id)
     const char *dp = (link.link_duplex == ETH_LINK_FULL_DUPLEX) ?
                      "full-duplex" : "half-duplex";
 
-    printf("link %s, speed %s - %s\n",
+    printf("link %s, speed %u Mpps - %s\n",
            link.link_status ? "up" : "down",
-           rte_eth_link_speed_to_str(link.link_speed),
+           link.link_speed,
            dp);
 }
 

@@ -1,6 +1,7 @@
 #ifndef _PACKET_H
 #define _PACKET_H
 
+#include <stdbool.h>
 #include <rte_mbuf.h>
 #include <rte_ether.h>
 #include <rte_byteorder.h>
@@ -42,7 +43,8 @@ void generate_ftuple_packet(struct rte_mbuf *mbuf,
                             struct rte_ether_addr *src_mac,
                             struct rte_ether_addr *dst_mac,
                             int size,
-                            struct ftuple *ftuple);
+                            struct ftuple *ftuple,
+                            bool print_packet);
 
 /* Reads a single packet from "mbuf", returns its timestamp into "timestamp".
  * Returns 0 on valid packet. */

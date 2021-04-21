@@ -29,7 +29,8 @@ generate_ftuple_packet(struct rte_mbuf *mbuf,
                        struct rte_ether_addr *src_mac,
                        struct rte_ether_addr *dst_mac,
                        int size,
-                       struct ftuple *ftuple)
+                       struct ftuple *ftuple,
+                       bool print_packet)
 {
     struct rte_ether_hdr *ether_hdr;
     struct rte_ipv4_hdr *ipv4_hdr;
@@ -37,16 +38,22 @@ generate_ftuple_packet(struct rte_mbuf *mbuf,
     int header_size;
     int payload_size;
 
+    rte_pktmbuf_reset(mbuf);
+    if (!rte_pktmbuf_is_contiguous(mbuf)) {
+        printf("mbuf is not contiguous\n");
+    }
+
     ether_hdr = rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr*);
     ipv4_hdr = rte_pktmbuf_mtod_offset(mbuf,
                                        struct rte_ipv4_hdr *,
                                        sizeof(*ether_hdr));
     header_size = sizeof(*ether_hdr) + sizeof(*ipv4_hdr);
 
-    /* Ethernet src & dst, type is IPv4 */
-    memcpy(&ether_hdr->s_addr, src_mac, sizeof(*src_mac));
-    memcpy(&ether_hdr->d_addr, dst_mac, sizeof(*dst_mac));
+    /* Dummy ethernet src & dst, type is IPv4 */
+    memset(ether_hdr, 0, sizeof(*ether_hdr));
     ether_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
+    /* memcpy(&ether_hdr->s_addr, src_mac, sizeof(*src_mac));
+    memcpy(&ether_hdr->d_addr, dst_mac, sizeof(*dst_mac)); */
 
     /* Do we work with TCP? */
     if (ftuple->ip_proto == IPPROTO_TCP) {
@@ -56,12 +63,12 @@ generate_ftuple_packet(struct rte_mbuf *mbuf,
                                           sizeof(*ether_hdr) +
                                           sizeof(*ipv4_hdr));
         header_size += sizeof(*tcp_hdr);
-        mbuf->l4_len = sizeof(*tcp_hdr);
         tcp_hdr->src_port = ftuple->src_port;
         tcp_hdr->dst_port = ftuple->dst_port;
         tcp_hdr->sent_seq = 0; /* No sequence number */
         tcp_hdr->recv_ack = 0; /* No ack number */
-        tcp_hdr->data_off = sizeof(*tcp_hdr) / 4; /* 20 Bytes header size */
+        tcp_hdr->data_off = 0x50; /* Data-offset (4bits)-reserved (4bits)
+                                     data-offset is 5: 20 bytes header size */
         tcp_hdr->tcp_flags = RTE_TCP_SYN_FLAG; /* Flag is always SYN */
         tcp_hdr->rx_win = rte_cpu_to_be_16(PACKET_TCP_WINSIZE);/* Window size */
         tcp_hdr->cksum = 0; /* Will be calculated next */
@@ -73,7 +80,6 @@ generate_ftuple_packet(struct rte_mbuf *mbuf,
                                           sizeof(*ether_hdr) +
                                           sizeof(*ipv4_hdr));
         header_size += sizeof(*udp_hdr);
-        mbuf->l4_len = sizeof(*udp_hdr);
         udp_hdr->src_port = ftuple->src_port;
         udp_hdr->dst_port = ftuple->dst_port;
         udp_hdr->dgram_len = rte_cpu_to_be_16(size - header_size +
@@ -86,7 +92,6 @@ generate_ftuple_packet(struct rte_mbuf *mbuf,
                                           sizeof(*ether_hdr) +
                                           sizeof(*ipv4_hdr));
         header_size += sizeof(*icmp_hdr);
-        mbuf->l4_len = sizeof(*icmp_hdr);
         icmp_hdr->icmp_type = 8;  /* Echo (ping) */
         icmp_hdr->icmp_code = 0;  /* N/A */
         icmp_hdr->icmp_cksum = 0; /* Calculated later */
@@ -146,8 +151,15 @@ generate_ftuple_packet(struct rte_mbuf *mbuf,
         compute_icmp_checksum(ipv4_hdr);
     }
 
-    mbuf->l2_len = sizeof(*ether_hdr);
-    mbuf->l3_len = sizeof(*ipv4_hdr);
+    /* Print packet -  debug */
+    if (print_packet) {
+        printf("Packet (%dB): ", size);
+        for (int i=0; i<size; i++) {
+            printf("%02X ", *(((unsigned char*)ether_hdr)+i));
+        }
+        printf("\n");
+    }
+
     mbuf->data_len = size;
     mbuf->pkt_len = size;
 }

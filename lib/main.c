@@ -38,8 +38,8 @@ static struct arguments app_args[] = {
 /* Name           R  B  Def     Help */
 {"txq",           0, 0, "4",    "Number of TX queues."},
 {"rxq",           0, 0, "4",    "Number of RX queues."},
-{"tx-descs",      0, 0, "4096", "Number of TX descs."},
-{"rx-descs",      0, 0, "4096", "Number of RX descs."},
+{"tx-descs",      0, 0, "256",  "Number of TX descs."},
+{"rx-descs",      0, 0, "256",  "Number of RX descs."},
 {"xstats",        0, 1, NULL,   "Show port xstats at the end."},
 {"hide-zeros",    0, 1, NULL,   "(xstats) Hide zero values."},
 {"superspreader", 0, 1, NULL,   "(Policy) Generate packets using a "
@@ -84,11 +84,11 @@ parse_app_args(int argc, char *argv[])
     memset(&tx_settings, 0, sizeof(tx_settings));
     memset(&rx_settings, 0, sizeof(rx_settings));
     tx_settings.tx_queues = ARG_INTEGER(app_args, "txq", 4);
-    tx_settings.tx_descs = ARG_INTEGER(app_args, "tx-descs", 4096);
+    tx_settings.tx_descs = ARG_INTEGER(app_args, "tx-descs", 256);
     tx_settings.rx_queues = 1;
     tx_settings.rx_descs = 64;
     rx_settings.rx_queues = ARG_INTEGER(app_args, "rxq", 4);
-    rx_settings.rx_descs = ARG_INTEGER(app_args, "rx-descs", 4096);
+    rx_settings.rx_descs = ARG_INTEGER(app_args, "rx-descs", 256);
     rx_settings.tx_queues = 1;
     rx_settings.tx_descs = 64;
     worker_settings.tx_queue_num = tx_settings.tx_queues;
@@ -235,6 +235,7 @@ main(int argc, char *argv[])
     }
 
     /* Am I TX or RX worker */
+    worker_settings.queue_index = 0;
     if (rte_socket_id() == tx_settings.socket) {
         printf ("Starting TX worker on core %d\n", rte_lcore_id());
         lcore_tx_worker(alloc_void_arg_bytes(&worker_settings,
@@ -280,7 +281,7 @@ lcore_tx_worker(void *arg)
     last_ns = get_time_ns();
 
     /* Allocate memory */
-    rte_mempool = create_mempool(socket, DEVICE_MEMPOOL_TX_ELEMENTS);
+    rte_mempool = create_mempool(socket, PACKET_BATCH);
     retval = rte_pktmbuf_alloc_bulk(rte_mempool, rte_mbufs, PACKET_BATCH);
     if (retval) {
         rte_exit(EXIT_FAILURE, "Failed to allocate mbuf \n");
@@ -299,7 +300,9 @@ lcore_tx_worker(void *arg)
                                    &tx_settings.mac_addr,
                                    &rx_settings.mac_addr,
                                    PACKET_SIZE,
-                                   &ftuple);
+                                   &ftuple,
+                                   (worker_settings.queue_index==0) &&
+                                   DEBUG_PRINT_PACKETS);
             pkt_counter++;
         }
 
