@@ -6,10 +6,12 @@
 #include <stdbool.h>
 
 #include <rte_mbuf.h>
+#include <rte_ether.h>
 
 /* A single port configuration */
 struct port_settings {
     struct rte_mempool **rte_mempools;
+    struct rte_ether_addr mac_addr;
     uint16_t port_id;
     uint16_t rx_queues;
     uint16_t tx_queues;
@@ -21,7 +23,7 @@ struct port_settings {
 int port_init(struct port_settings *settings);
 
 void port_get_status(uint16_t port_id);
-
+void port_xstats_clear(uint16_t port_id);
 void port_xstats_display(uint16_t port_id, bool hide_zeros);
 
 /* Create a mempool of "size" bytes on "socket" */

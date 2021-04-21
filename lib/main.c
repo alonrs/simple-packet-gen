@@ -176,6 +176,7 @@ main(int argc, char *argv[])
                          portid);
             }
             port_get_status(portid);
+            port_xstats_clear(portid);
         } else if (i == 1) {
             rx_settings.port_id = portid;
             if (port_init(&rx_settings) != 0) {
@@ -184,6 +185,7 @@ main(int argc, char *argv[])
                          portid);
             }
             port_get_status(portid);
+            port_xstats_clear(portid);
         } else {
             break;
         }
@@ -293,7 +295,11 @@ lcore_tx_worker(void *arg)
                                       worker_settings.tx_queue_num,
                                       &ftuple,
                                       worker_settings.args);
-            generate_ftuple_packet(rte_mbufs[i], PACKET_SIZE, &ftuple);
+            generate_ftuple_packet(rte_mbufs[i],
+                                   &tx_settings.mac_addr,
+                                   &rx_settings.mac_addr,
+                                   PACKET_SIZE,
+                                   &ftuple);
             pkt_counter++;
         }
 

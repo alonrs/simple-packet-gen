@@ -24,9 +24,6 @@
 
 static const struct rte_eth_conf port_conf_default = {
     .link_speeds = ETH_LINK_SPEED_AUTONEG,
-    .rxmode = {
-        .max_rx_pkt_len = RTE_ETHER_MAX_LEN
-    }
 };
 
 /* Create a mempool of "size" bytes on "socket" */
@@ -86,10 +83,6 @@ port_init(struct port_settings *settings)
         printf("Error during getting device (port %u) info: %s\n",
                 settings->port_id, strerror(-retval));
         return retval;
-    }
-
-    if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE) {
-        port_conf.txmode.offloads |= DEV_TX_OFFLOAD_MBUF_FAST_FREE;
     }
 
     settings->socket = rte_eth_dev_socket_id(settings->port_id);
@@ -153,6 +146,12 @@ port_init(struct port_settings *settings)
     /* Enable RX in promiscuous mode for the Ethernet device. */
     retval = rte_eth_promiscuous_enable(settings->port_id);
     if (retval != 0) {
+        return retval;
+    }
+
+    /* Set MAC address */
+    retval = rte_eth_macaddr_get(settings->port_id, &settings->mac_addr);
+    if (retval < 0) {
         return retval;
     }
 
@@ -247,3 +246,17 @@ port_xstats_display(uint16_t port_id, bool hide_zeros)
     free(xstats_names);
     free(xstats);
 }
+
+void
+port_xstats_clear(uint16_t port_id)
+{
+	int ret;
+
+	ret = rte_eth_xstats_reset(port_id);
+	if (ret != 0) {
+		printf("%s: Error: failed to reset xstats (port %u): %s",
+		       __func__, port_id, strerror(-ret));
+		return;
+	}
+}
+

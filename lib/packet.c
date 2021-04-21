@@ -25,7 +25,11 @@ static void compute_icmp_checksum(struct rte_ipv4_hdr *ipv4_hdr);
 /* Fills "mbuf" with a single IPV4 packet of "size" bytes with
  * "ftuple" 5-tuple header info */
 void
-generate_ftuple_packet(struct rte_mbuf *mbuf, int size, struct ftuple *ftuple)
+generate_ftuple_packet(struct rte_mbuf *mbuf,
+                       struct rte_ether_addr *src_mac,
+                       struct rte_ether_addr *dst_mac,
+                       int size,
+                       struct ftuple *ftuple)
 {
     struct rte_ether_hdr *ether_hdr;
     struct rte_ipv4_hdr *ipv4_hdr;
@@ -39,8 +43,9 @@ generate_ftuple_packet(struct rte_mbuf *mbuf, int size, struct ftuple *ftuple)
                                        sizeof(*ether_hdr));
     header_size = sizeof(*ether_hdr) + sizeof(*ipv4_hdr);
 
-    /* Dummy ethernet src & dst, type is IPv4 */
-    memset(ether_hdr, 0, sizeof(*ether_hdr));
+    /* Ethernet src & dst, type is IPv4 */
+    memcpy(&ether_hdr->s_addr, src_mac, sizeof(*src_mac));
+    memcpy(&ether_hdr->d_addr, dst_mac, sizeof(*dst_mac));
     ether_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
     /* Do we work with TCP? */

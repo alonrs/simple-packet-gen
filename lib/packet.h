@@ -2,6 +2,7 @@
 #define _PACKET_H
 
 #include <rte_mbuf.h>
+#include <rte_ether.h>
 #include <rte_byteorder.h>
 
 /* Error types */
@@ -38,6 +39,8 @@ get_port(uint16_t port)
 /* Fills "mbuf" with a single IPV4 packet of "size" bytes with
  * "ftuple" 5-tuple header info */
 void generate_ftuple_packet(struct rte_mbuf *mbuf,
+                            struct rte_ether_addr *src_mac,
+                            struct rte_ether_addr *dst_mac,
                             int size,
                             struct ftuple *ftuple);
 
