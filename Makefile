@@ -25,15 +25,18 @@ endif
 
 # Set package config path to dkd install dir
 PCFILES=$(shell find $(PWD)/dpdk/build/install/ -name "*.pc")
-export PKG_CONFIG_PATH=$(shell dirname $(PCFILES) | sort | uniq)
+PKG_CONFIG_PATH=$(shell dirname $(PCFILES) | sort | uniq)
 
 # Build using pkg-config variables if possible
-ifneq ($(shell $(PKGCONF) --exists libdpdk && echo 0),0)
+ifneq ($(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
+               $(PKGCONF) --exists libdpdk && echo 0),0)
 $(error "No installation of DPDK found. Did you run build.sh?")
 endif
 
-LDFLAGS:=$(shell $(PKGCONF) --static --libs libdpdk)
-CFLAGS +=$(shell $(PKGCONF) --cflags libdpdk)
+LDFLAGS:=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
+                 $(PKGCONF) --static --libs libdpdk)
+CFLAGS +=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
+                 $(PKGCONF) --cflags libdpdk)
 
 # Search for all objects
 SOURCES:=$(wildcard $(LIB_DIR)/*.c)
@@ -43,7 +46,7 @@ release: $(BIN_DIR)/client.exe
 debug:   $(BIN_DIR)/client.exe
 
 $(BIN_DIR)/client.exe: $(OBJECTS)
-	$(CC) $(CFLAGS) $+ -o $@ $(LDFLAGS)
+	$(CC) $(CFLAGS) $+ $(LDFLAGS) -o $@
 
 # Include submodule with rules to create objects
 include $(BIN_DIR)/objects.mk
