@@ -1,3 +1,0 @@
-[submodule "dpdk"]
-	path = dpdk
-	url = https://github.com/DPDK/dpdk.git

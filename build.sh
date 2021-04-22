@@ -7,9 +7,12 @@ install_dir=$build_dir/install
 # Fetch DPDK repository
 if [[ ! -d $dpdk_dir || -z $(ls $dpdk_dir/*) ]]; then
     echo "Fetching DPDK repository from git..."
-    git submodule update --init
+    git clone https://dpdk.org/git/dpdk-stable $dpdk_dir
 fi
+
+# Checkout DPDK version tag
 cd $dpdk_dir
+git checkout v20.11.1
 
 # Create the DPDK build dir
 if [[ -d $build_dir ]]; then
