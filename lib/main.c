@@ -205,7 +205,7 @@ main(int argc, char *argv[])
     }
 
     /* Start workers on all cores */
-    RTE_LCORE_FOREACH_WORKER(lcore_id) {
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
         socket = rte_lcore_to_socket_id(lcore_id);
         if ((socket == tx_settings.socket) &&
             (tx_workers < tx_settings.tx_queues)) {

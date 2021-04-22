@@ -14,7 +14,7 @@ fi
 
 # Checkout DPDK version tag
 cd $dpdk_dir
-git checkout v20.11.1
+git checkout v19.11.8
 
 # Create the DPDK build dir
 if [[ -d $build_dir ]]; then
