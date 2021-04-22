@@ -34,7 +34,7 @@ $(error "No installation of DPDK found. Did you run build.sh?")
 endif
 
 LDFLAGS:=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
-                 $(PKGCONF) --static --libs libdpdk)
+                 $(PKGCONF) --libs libdpdk)
 CFLAGS +=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
                  $(PKGCONF) --cflags libdpdk)
 
