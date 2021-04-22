@@ -10,7 +10,6 @@
 #include <rte_byteorder.h>
 #include <rte_eal.h>
 #include <rte_ethdev.h>
-#include <rte_ethdev.h>
 #include <rte_cycles.h>
 #include <rte_lcore.h>
 #include <rte_mbuf.h>
@@ -22,29 +21,46 @@
 #include "common.h"
 #include "device.h"
 
+#define MAX(A,B) (A) > (B) ? (A) : (B)
+
 /* Create a mempool of "size" bytes on "socket" */
 struct rte_mempool*
-create_mempool(int socket, int size) {
+create_mempool(int socket, int size, int num_elements) {
     static volatile int counter = 0;
     struct rte_mempool *rte_mempool;
     char pool_name[32];
+    uint32_t cache_size;
 
-    sprintf(pool_name, "mempool-%d", __sync_fetch_and_add(&counter, 1));
+    cache_size = DEVICE_MEMPOOL_CACHE_SIZE;
+    num_elements = MAX(num_elements, 2048);
+
+    sprintf(pool_name, "mempool%d", __sync_fetch_and_add(&counter, 1));
     rte_mempool = rte_pktmbuf_pool_create(pool_name,
-                                          DEVICE_MEMPOOL_RX_ELEMENTS-1,
-                                          DEVICE_MEMPOOL_CACHE_SIZE,
+                                          num_elements-1,
+                                          cache_size,
                                           0,
                                           size + RTE_PKTMBUF_HEADROOM,
                                           socket);
     if (rte_mempool  == NULL) {
-        rte_exit(EXIT_FAILURE, "Cannot create mbuf pool %s\n", pool_name);
+        rte_exit(EXIT_FAILURE,
+                 "Cannot create mbuf pool %s with %d elements of "
+                 "%d bytes (%u elements in core cache) on socket %d. \n",
+                 pool_name,
+                 num_elements,
+                 size,
+                 cache_size,
+                 socket);
+    } else {
+        printf("Created %s with %d elements each of %d bytes "
+               "on socket %d. \n",
+               pool_name, num_elements, size, socket);
     }
     return rte_mempool;
 }
 
 /* Creates a mempool for each RX queue */
 static struct rte_mempool**
-create_mempools(int rx_queues, int socket)
+create_mempools(int rx_queues, int socket, int size, int descs)
 {
     struct rte_mempool **rte_mempools;
 
@@ -53,7 +69,7 @@ create_mempools(int rx_queues, int socket)
         rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
     }
     for (int i=0; i<rx_queues; i++) {
-        rte_mempools[i] = create_mempool(socket, RTE_MBUF_DEFAULT_DATAROOM);
+        rte_mempools[i] = create_mempool(socket, size, descs*2);
     }
     return rte_mempools;
 }
@@ -63,9 +79,6 @@ int
 port_init(struct port_settings *settings)
 {
     struct rte_eth_dev_info dev_info;
-    struct rte_eth_conf port_conf = {};
-    struct rte_eth_rxconf rx_conf = {};
-    struct rte_eth_txconf tx_conf = {};
     int retval;
     uint16_t q;
 
@@ -81,6 +94,25 @@ port_init(struct port_settings *settings)
     }
 
     settings->socket = rte_eth_dev_socket_id(settings->port_id);
+
+    /* Set port configuration */
+    struct rte_eth_conf port_conf = {
+        .link_speeds = ETH_LINK_SPEED_AUTONEG,
+        .rxmode = {
+            .max_rx_pkt_len = RTE_ETHER_MAX_LEN,
+            .offloads = DEV_RX_OFFLOAD_CHECKSUM
+        },
+    };
+
+    if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE) {
+        port_conf.txmode.offloads |= DEV_TX_OFFLOAD_MBUF_FAST_FREE;
+    }
+
+    struct rte_eth_txconf tx_conf = dev_info.default_txconf;
+    tx_conf.offloads = port_conf.txmode.offloads;
+
+    struct rte_eth_rxconf rx_conf = dev_info.default_rxconf;
+    rx_conf.offloads = port_conf.rxmode.offloads;
 
     /* Configure the Ethernet device. */
     retval = rte_eth_dev_configure(settings->port_id,
@@ -113,7 +145,9 @@ port_init(struct port_settings *settings)
     /* Allocate memory pools per RX queue */
     if (settings->rx_queues) {
         settings->rte_mempools = create_mempools(settings->rx_queues,
-                                                 settings->socket);
+                                                 settings->socket,
+                                                 DEVICE_MEMPOOL_DEF_SIZE,
+                                                 settings->rx_descs*2);
     }
 
     /* Allocate and set up RX queues */

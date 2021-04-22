@@ -45,8 +45,8 @@ static struct arguments app_args[] = {
 {"superspreader", 0, 1, NULL,   "(Policy) Generate packets using a "
                                 "superspreader policy, continuously "
                                 "increaseing dst IP and dst port."},
-{"nflows",        0, 0, "100",  "(Policy:superspreader) Number of unique flows "
-                                "for the superspreader policy."},
+{"nflows",        0, 0, "100",  "(Policy:superspreader) Number of unique "
+                                "flows for the superspreader policy."},
 {NULL,            0, 0, NULL,   "Simple DPDK client."}
 };
 
@@ -263,7 +263,7 @@ lcore_tx_worker(void *arg)
 {
     struct worker_settings worker_settings;
     struct rte_mempool *rte_mempool;
-    struct rte_mbuf *rte_mbufs[PACKET_BATCH];
+    struct rte_mbuf *rte_mbufs[BATCH_SIZE];
     struct ftuple ftuple;
     uint16_t retval;
     uint64_t last_ns;
@@ -281,8 +281,10 @@ lcore_tx_worker(void *arg)
     last_ns = get_time_ns();
 
     /* Allocate memory */
-    rte_mempool = create_mempool(socket, PACKET_BATCH);
-    retval = rte_pktmbuf_alloc_bulk(rte_mempool, rte_mbufs, PACKET_BATCH);
+    rte_mempool = create_mempool(socket,
+                                 DEVICE_MEMPOOL_DEF_SIZE,
+                                 tx_settings.tx_descs*2);
+    retval = rte_pktmbuf_alloc_bulk(rte_mempool, rte_mbufs, BATCH_SIZE);
     if (retval) {
         rte_exit(EXIT_FAILURE, "Failed to allocate mbuf \n");
     }
@@ -290,7 +292,7 @@ lcore_tx_worker(void *arg)
     while(running.val) {
 
         /* Generate packet batch based on the 5-tuple */
-        for (int i=0; i<PACKET_BATCH; i++) {
+        for (int i=0; i<BATCH_SIZE; i++) {
             worker_settings.generator(pkt_counter,
                                       worker_settings.queue_index,
                                       worker_settings.tx_queue_num,
@@ -310,7 +312,7 @@ lcore_tx_worker(void *arg)
         retval = rte_eth_tx_burst(tx_settings.port_id,
                                   worker_settings.queue_index,
                                   rte_mbufs,
-                                  PACKET_BATCH);
+                                  BATCH_SIZE);
 
         /* Update TX counter */
         if (retval > 0) {
@@ -336,7 +338,7 @@ lcore_tx_worker(void *arg)
 static int
 lcore_rx_worker(void *arg)
 {
-    struct rte_mbuf *rte_mbufs[PACKET_BATCH];
+    struct rte_mbuf *rte_mbufs[BATCH_SIZE];
     struct worker_settings worker_settings;
     uint16_t packets;
     uint64_t last_ns, latency_ns, diff_ns;
@@ -359,7 +361,7 @@ lcore_rx_worker(void *arg)
         packets = rte_eth_rx_burst(rx_settings.port_id,
                                    worker_settings.queue_index,
                                    rte_mbufs,
-                                   PACKET_BATCH);
+                                   BATCH_SIZE);
 
         diff_total = 0;
         diff_counter = 0;
@@ -377,10 +379,9 @@ lcore_rx_worker(void *arg)
             }
             rte_pktmbuf_free(rte_mbufs[i]);
         }
-
         /* Update RX counters */
         if (packets > 0) {
-            atomic_fetch_add(&rx_counter.val, packets);
+           atomic_fetch_add(&rx_counter.val, packets);
         }
         if (err_counter > 0) {
             atomic_fetch_add(&rx_err_counter.val, err_counter);
