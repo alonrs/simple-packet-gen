@@ -14,6 +14,7 @@
 #include "config.h"
 #include "common.h"
 #include "arguments.h"
+#include "vector.h"
 #include "packet.h"
 #include "device.h"
 #include "generator.h"
@@ -21,10 +22,13 @@
 static int lcore_tx_worker(void *arg);
 static int lcore_rx_worker(void *arg);
 
+enum { MAX_EAL_ARGS = 64 };
+
 /* Passed to worker threads */
 struct worker_settings {
     generator_policy_func_t generator; /* Packet generator */
     void *args;                        /* Generator custom arguments */
+    bool collect_latency_stats;
     uint16_t tx_leader_core_id;
     uint16_t rx_leader_core_id;
     uint16_t queue_index;
@@ -52,9 +56,6 @@ static struct arguments app_args[] = {
 {NULL,            0, 0, NULL,   "Simple DPDK client."}
 };
 
-enum { MAX_EAL_ARGS = 64 };
-enum { LATENCY_BUFFER = 8192 };
-
 /* Atomic messages accross cores, each a single cache line */
 MESSAGE_T(bool, running);
 MESSAGE_T(long, tx_counter);
@@ -62,9 +63,9 @@ MESSAGE_T(long, rx_counter);
 MESSAGE_T(long, rx_err_counter);
 
 rte_spinlock_t latency_lock;
-rte_spinlock_t latency_dump_lock;
 atomic_long latency_counter;
 atomic_long latency_total;
+static struct vector *latency_vector;
 
 static struct port_settings tx_settings;
 static struct port_settings rx_settings;
@@ -97,6 +98,7 @@ initialize_settings()
     rx_settings.tx_descs = 64;
     worker_settings.tx_queue_num = tx_settings.tx_queues;
     worker_settings.rx_queue_num = rx_settings.rx_queues;
+    worker_settings.collect_latency_stats = ARG_BOOL(app_args, "lat-file", 0);
 
     /* Set generator policy */
     policy_t policy = POLICY_UNDEFINED;
@@ -130,13 +132,11 @@ initialize_dpdk()
     int argc;
 
     args = ARG_STRING(app_args, "eal", "");
-    args_mod = (char*)malloc(sizeof(char)*(strlen(args)+1));
-    if (!args_mod) {
-        exit(EXIT_FAILURE);
-    }
+    args_mod = xmalloc(sizeof(char)*(strlen(args)+1));
 
     strcpy(args_mod, args);
     argc = 1;
+    argv[0] = "";
     cur = strtok(args_mod, " ");
 
     while (cur && argc < MAX_EAL_ARGS-1) {
@@ -158,6 +158,36 @@ initialize_dpdk()
     }
 
     free(args_mod);
+}
+
+/* Save latency file */
+static void
+save_latency_file()
+{
+    const char *filename;
+    FILE *file;
+
+    filename = ARG_STRING(app_args, "lat-file", NULL);
+    if (!filename) {
+        return;
+    }
+
+    file = fopen(filename, "w");
+    if (!file) {
+        printf("Error: cannot open \"%s\" for writing. \n", filename);
+        return;
+    }
+
+    printf("Saving %lu collected latency items in \"%s\"... \n",
+           vector_size(latency_vector), filename);
+
+    /* For each value in latency vector */
+    uint64_t val;
+    VECTOR_FOR_EACH(latency_vector, val, uint64_t) {
+        fprintf(file, "%lu\n", val);
+    }
+
+    fclose(file);
 }
 
 int
@@ -188,7 +218,7 @@ main(int argc, char *argv[])
     atomic_init(&latency_counter, 0);
     atomic_init(&latency_total, 0);
     rte_spinlock_init(&latency_lock);
-    rte_spinlock_init(&latency_dump_lock);
+    latency_vector = vector_init(sizeof(struct vector*));
 
     /* Check that there is an even number of ports to send/receive on. */
     nb_ports = rte_eth_dev_count_avail();
@@ -280,13 +310,21 @@ main(int argc, char *argv[])
                                              sizeof(worker_settings)));
     }
 
-    /* Show xstats. Will get here after signal */
+    /* Wait for all cores. Will get here only after signal. */
+    RTE_LCORE_FOREACH_SLAVE(lcore_id) {
+        rte_eal_wait_lcore(lcore_id);
+    }
+
+    /* Show xstats */
     bool xstats = ARG_BOOL(app_args, "xstats", false);
     bool hide_zeros = ARG_BOOL(app_args, "hide-zeros", false);
     if (xstats) {
         port_xstats_display(tx_settings.port_id, hide_zeros);
         port_xstats_display(rx_settings.port_id, hide_zeros);
     }
+
+    /* Save latency file */
+    save_latency_file();
 
     return 0;
 }
@@ -377,14 +415,11 @@ lcore_rx_worker(void *arg)
     uint64_t last_ns, current_ns, diff_ns;
     uint64_t latency_ns, timestamp;
     long diff_counter, diff_total;
-    uint64_t *latency_buffer;
-    const char *lat_filename;
-    int latency_counter;
+    long counter, err_counter;
+    struct vector *local_vector;
     uint16_t packets;
-    FILE *lat_file;
     int core;
     int retval;
-    long counter, err_counter;
 
     get_void_arg_bytes(&worker_settings,
                        arg,
@@ -393,25 +428,8 @@ lcore_rx_worker(void *arg)
     core = rte_lcore_id();
     last_ns = get_time_ns();
 
-    /* Allocate latency buffer */
-    lat_file = NULL;
-    latency_buffer = NULL;
-    latency_counter = 0;
-    lat_filename = ARG_STRING(app_args, "lat-file", NULL);
-    if (lat_filename) {
-        lat_file=fopen(lat_filename, "w");
-        if (!lat_file) {
-            printf("Error: cannot open \"%s\" for write \n", lat_filename);
-            exit(1);
-        }
-
-        latency_buffer = (uint64_t*)malloc(sizeof(uint64_t)*LATENCY_BUFFER);
-        if (!latency_buffer) {
-            printf("Error: cannot allocate memory for latency buffer \n");
-            exit(1);
-        }
-        memset(latency_buffer,0, sizeof(uint64_t)*LATENCY_BUFFER);
-    }
+    /* Local vector for latency values */
+    local_vector = vector_init(sizeof(uint64_t));
 
     while(running.val) {
 
@@ -430,31 +448,18 @@ lcore_rx_worker(void *arg)
         for (uint16_t i=0; i<packets; i++) {
             retval = read_packet(rte_mbufs[i], &timestamp);
             rte_pktmbuf_free(rte_mbufs[i]);
-
             if (retval) {
                 err_counter++;
                 continue;
             }
-
             /* Update local stats */
             latency_ns = current_ns - timestamp;
             diff_total += latency_ns;
             diff_counter++;
-
-            /* Update local latency buffer */
-            if (!latency_buffer) {
-                continue;
-            }
-            latency_buffer[latency_counter++] = latency_ns;
-
-            /* Dump buffer to output file */
-            if (latency_counter == LATENCY_BUFFER) {
-                for (int j=0; i<LATENCY_BUFFER; j++) {
-                    rte_spinlock_lock(&latency_dump_lock);
-                    fprintf(lat_file, "%lu\n", latency_buffer[j]);
-                    rte_spinlock_unlock(&latency_dump_lock);
-                }
-                latency_counter = 0;
+            /* Update local vector every LATENCY_COLLECTOR_GAP packets */
+            if(worker_settings.collect_latency_stats &&
+              (i%LATENCY_COLLECTOR_GAP==0)) {
+                vector_push(local_vector, &latency_ns);
             }
         }
 
@@ -478,7 +483,6 @@ lcore_rx_worker(void *arg)
         if (core == worker_settings.rx_leader_core_id) {
             diff_ns = get_time_ns() - last_ns;
             if (diff_ns > 1e9) {
-
                 /* Calculate RX, RX errors */
                 counter = atomic_exchange(&rx_counter.val, 0);
                 double mpps = (double)counter/1e6/(diff_ns/1e9);
@@ -499,7 +503,12 @@ lcore_rx_worker(void *arg)
         }
     }
 
-    free(latency_buffer);
+    /* Push values from local vector into the global vector */
+    uint64_t val;
+    VECTOR_FOR_EACH(local_vector, val, uint64_t) {
+        vector_push(latency_vector, &val);
+    }
+    vector_destroy(local_vector);
 
     return 0;
 }
