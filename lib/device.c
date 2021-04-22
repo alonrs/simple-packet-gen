@@ -187,6 +187,9 @@ port_init(struct port_settings *settings)
            settings->port_id, settings->rx_queues, settings->rx_descs,
            settings->tx_queues, settings->tx_descs, settings->socket);
 
+    port_get_status(settings->port_id);
+    port_xstats_clear(settings->port_id);
+
     return 0;
 }
 

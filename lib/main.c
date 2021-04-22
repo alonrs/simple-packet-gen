@@ -34,18 +34,22 @@ struct worker_settings {
     uint16_t queue_index;
     uint16_t tx_queue_num;
     uint16_t rx_queue_num;
+    int time_limit;
 };
 
 /* Application arguments and help.
  * Format: name, required, is-boolean, default, help */
 static struct arguments app_args[] = {
 /* Name           R  B  Def     Help */
+{"tx",            1, 0, "0",    "TX port number."},
+{"rx" ,           1, 0, "0",    "RX port number."},
 {"eal",           0, 0, "",     "DPDK EAL arguments."},
 {"txq",           0, 0, "4",    "Number of TX queues."},
 {"rxq",           0, 0, "4",    "Number of RX queues."},
 {"tx-descs",      0, 0, "256",  "Number of TX descs."},
 {"rx-descs",      0, 0, "256",  "Number of RX descs."},
 {"lat-file",      0, 0, NULL,   "Out filename for latency per packet values."},
+{"time-limit",    0, 0, NULL,   "Stop application after VALUE seconds"},
 {"xstats",        0, 1, NULL,   "Show port xstats at the end."},
 {"hide-zeros",    0, 1, NULL,   "(xstats) Hide zero values."},
 {"superspreader", 0, 1, NULL,   "(Policy) Generate packets using a "
@@ -88,10 +92,12 @@ initialize_settings()
     /* Initialize port settings */
     memset(&tx_settings, 0, sizeof(tx_settings));
     memset(&rx_settings, 0, sizeof(rx_settings));
+    tx_settings.port_id = ARG_INTEGER(app_args, "tx", 0);
     tx_settings.tx_queues = ARG_INTEGER(app_args, "txq", 4);
     tx_settings.tx_descs = ARG_INTEGER(app_args, "tx-descs", 256);
     tx_settings.rx_queues = 1;
     tx_settings.rx_descs = 64;
+    rx_settings.port_id = ARG_INTEGER(app_args, "rx", 1);
     rx_settings.rx_queues = ARG_INTEGER(app_args, "rxq", 4);
     rx_settings.rx_descs = ARG_INTEGER(app_args, "rx-descs", 256);
     rx_settings.tx_queues = 1;
@@ -99,6 +105,7 @@ initialize_settings()
     worker_settings.tx_queue_num = tx_settings.tx_queues;
     worker_settings.rx_queue_num = rx_settings.rx_queues;
     worker_settings.collect_latency_stats = ARG_BOOL(app_args, "lat-file", 0);
+    worker_settings.time_limit = ARG_INTEGER(app_args, "time-limit", 0);
 
     /* Set generator policy */
     policy_t policy = POLICY_UNDEFINED;
@@ -229,31 +236,16 @@ main(int argc, char *argv[])
         printf("Warning: got more than two ports; using first two.\n");
     }
 
-    /* Initialize first two ports. */
-    i = 0;
-    RTE_ETH_FOREACH_DEV(portid) {
-        if (i == 0) {
-            tx_settings.port_id = portid;
-            if (port_init(&tx_settings) != 0) {
-                rte_exit(EXIT_FAILURE,
-                         "Cannot init port %" PRIu16 "\n",
-                         portid);
-            }
-            port_get_status(portid);
-            port_xstats_clear(portid);
-        } else if (i == 1) {
-            rx_settings.port_id = portid;
-            if (port_init(&rx_settings) != 0) {
-                rte_exit(EXIT_FAILURE,
-                         "Cannot init port %" PRIu16 "\n",
-                         portid);
-            }
-            port_get_status(portid);
-            port_xstats_clear(portid);
-        } else {
-            break;
-        }
-        i++;
+    /* Initialize ports */
+    if (port_init(&tx_settings)) {
+        rte_exit(EXIT_FAILURE,
+                 "Cannot init port %" PRIu16 "\n",
+                 tx_settings.port_id);
+    }
+    if (port_init(&rx_settings)) {
+        rte_exit(EXIT_FAILURE,
+                 "Cannot init port %" PRIu16 "\n",
+                 rx_settings.port_id);
     }
 
     tx_workers=0;
@@ -342,6 +334,7 @@ lcore_tx_worker(void *arg)
     uint64_t pkt_counter;
     double diff_ns;
     int socket, core;
+    int secs;
 
     get_void_arg_bytes(&worker_settings,
                        arg,
@@ -350,6 +343,7 @@ lcore_tx_worker(void *arg)
     socket = rte_socket_id();
     core = rte_lcore_id();
     pkt_counter = 0;
+    secs = 0;
     last_ns = get_time_ns();
 
     /* Allocate memory */
@@ -399,6 +393,13 @@ lcore_tx_worker(void *arg)
                 double mpps = (double)counter/1e6/(diff_ns/1e9);
                 printf("TX %.4lf Mpps\n", mpps);
                 last_ns = get_time_ns();
+                secs++;
+                /* Time limit */
+                if (worker_settings.time_limit &&
+                    secs >= worker_settings.time_limit) {
+                    printf("Time limit have reached \n");
+                    atomic_store(&running.val, false);
+                }
             }
         }
     }
