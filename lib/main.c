@@ -36,10 +36,12 @@ struct worker_settings {
  * Format: name, required, is-boolean, default, help */
 static struct arguments app_args[] = {
 /* Name           R  B  Def     Help */
+{"eal",           0, 0, "",     "DPDK EAL arguments."},
 {"txq",           0, 0, "4",    "Number of TX queues."},
 {"rxq",           0, 0, "4",    "Number of RX queues."},
 {"tx-descs",      0, 0, "256",  "Number of TX descs."},
 {"rx-descs",      0, 0, "256",  "Number of RX descs."},
+{"lat-file",      0, 0, NULL,   "Out filename for latency per packet values."},
 {"xstats",        0, 1, NULL,   "Show port xstats at the end."},
 {"hide-zeros",    0, 1, NULL,   "(xstats) Hide zero values."},
 {"superspreader", 0, 1, NULL,   "(Policy) Generate packets using a "
@@ -50,6 +52,9 @@ static struct arguments app_args[] = {
 {NULL,            0, 0, NULL,   "Simple DPDK client."}
 };
 
+enum { MAX_EAL_ARGS = 64 };
+enum { LATENCY_BUFFER = 8192 };
+
 /* Atomic messages accross cores, each a single cache line */
 MESSAGE_T(bool, running);
 MESSAGE_T(long, tx_counter);
@@ -57,6 +62,7 @@ MESSAGE_T(long, rx_counter);
 MESSAGE_T(long, rx_err_counter);
 
 rte_spinlock_t latency_lock;
+rte_spinlock_t latency_dump_lock;
 atomic_long latency_counter;
 atomic_long latency_total;
 
@@ -76,10 +82,8 @@ signal_handler(int signum)
 
 /* Parse application arguments */
 static void
-parse_app_args(int argc, char *argv[])
+initialize_settings()
 {
-    arg_parse(argc, argv, app_args);
-
     /* Initialize port settings */
     memset(&tx_settings, 0, sizeof(tx_settings));
     memset(&rx_settings, 0, sizeof(rx_settings));
@@ -115,6 +119,47 @@ parse_app_args(int argc, char *argv[])
     }}
 }
 
+/* Initialzie DPDK from EAL arguments */
+static void
+initialize_dpdk()
+{
+    const char *args;
+    char *args_mod;
+    char *argv[MAX_EAL_ARGS];
+    char *cur;
+    int argc;
+
+    args = ARG_STRING(app_args, "eal", "");
+    args_mod = (char*)malloc(sizeof(char)*(strlen(args)+1));
+    if (!args_mod) {
+        exit(EXIT_FAILURE);
+    }
+
+    strcpy(args_mod, args);
+    argc = 1;
+    cur = strtok(args_mod, " ");
+
+    while (cur && argc < MAX_EAL_ARGS-1) {
+        argv[argc++] = cur;
+        cur = strtok(0, " ");
+    }
+
+    /* Print EAL arguments */
+    printf("EAL arguments: ");
+    for (int i=1; i<argc; i++) {
+        printf("[%s] ", argv[i]);
+    }
+    printf("\n");
+
+    /* Initialize the Environment Abstraction Layer (EAL). */
+    int ret = rte_eal_init(argc, argv);
+    if (ret < 0) {
+        rte_exit(EXIT_FAILURE, "Error with EAL initialization\n");
+    }
+
+    free(args_mod);
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -126,22 +171,10 @@ main(int argc, char *argv[])
     uint16_t rx_workers;
     int i;
 
-    /* Basic usage */
-    printf("Use sudo %s --help to show DPDK EAL help message. \n"
-           "Use sudo %s -- --help to show application help message. \n",
-            argv[0], argv[0]);
-
-    /* Initialize the Environment Abstraction Layer (EAL). */
-    int ret = rte_eal_init(argc, argv);
-    if (ret < 0) {
-        rte_exit(EXIT_FAILURE, "Error with EAL initialization\n");
-    }
-
-    argc -= ret;
-    argv += ret;
-
-    /* Parse application argumnets */
-    parse_app_args(argc, argv);
+    /* Parse application argumnets, initialize */
+    arg_parse(argc, argv, app_args);
+    initialize_settings(argc, argv);
+    initialize_dpdk();
 
     /* Initialize signal handler */
     atomic_init(&running.val, true);
@@ -155,6 +188,7 @@ main(int argc, char *argv[])
     atomic_init(&latency_counter, 0);
     atomic_init(&latency_total, 0);
     rte_spinlock_init(&latency_lock);
+    rte_spinlock_init(&latency_dump_lock);
 
     /* Check that there is an even number of ports to send/receive on. */
     nb_ports = rte_eth_dev_count_avail();
@@ -340,10 +374,14 @@ lcore_rx_worker(void *arg)
 {
     struct rte_mbuf *rte_mbufs[BATCH_SIZE];
     struct worker_settings worker_settings;
-    uint16_t packets;
-    uint64_t last_ns, latency_ns, diff_ns;
-    uint64_t timestamp;
+    uint64_t last_ns, current_ns, diff_ns;
+    uint64_t latency_ns, timestamp;
     long diff_counter, diff_total;
+    uint64_t *latency_buffer;
+    const char *lat_filename;
+    int latency_counter;
+    uint16_t packets;
+    FILE *lat_file;
     int core;
     int retval;
     long counter, err_counter;
@@ -354,6 +392,26 @@ lcore_rx_worker(void *arg)
                        true);
     core = rte_lcore_id();
     last_ns = get_time_ns();
+
+    /* Allocate latency buffer */
+    lat_file = NULL;
+    latency_buffer = NULL;
+    latency_counter = 0;
+    lat_filename = ARG_STRING(app_args, "lat-file", NULL);
+    if (lat_filename) {
+        lat_file=fopen(lat_filename, "w");
+        if (!lat_file) {
+            printf("Error: cannot open \"%s\" for write \n", lat_filename);
+            exit(1);
+        }
+
+        latency_buffer = (uint64_t*)malloc(sizeof(uint64_t)*LATENCY_BUFFER);
+        if (!latency_buffer) {
+            printf("Error: cannot allocate memory for latency buffer \n");
+            exit(1);
+        }
+        memset(latency_buffer,0, sizeof(uint64_t)*LATENCY_BUFFER);
+    }
 
     while(running.val) {
 
@@ -366,19 +424,40 @@ lcore_rx_worker(void *arg)
         diff_total = 0;
         diff_counter = 0;
         err_counter = 0;
-        latency_ns = get_time_ns();
+        current_ns = get_time_ns();
 
         /* Check timestamps, update latency, free memory */
         for (uint16_t i=0; i<packets; i++) {
             retval = read_packet(rte_mbufs[i], &timestamp);
+            rte_pktmbuf_free(rte_mbufs[i]);
+
             if (retval) {
                 err_counter++;
-            } else {
-                diff_total += (latency_ns - timestamp);
-                diff_counter++;
+                continue;
             }
-            rte_pktmbuf_free(rte_mbufs[i]);
+
+            /* Update local stats */
+            latency_ns = current_ns - timestamp;
+            diff_total += latency_ns;
+            diff_counter++;
+
+            /* Update local latency buffer */
+            if (!latency_buffer) {
+                continue;
+            }
+            latency_buffer[latency_counter++] = latency_ns;
+
+            /* Dump buffer to output file */
+            if (latency_counter == LATENCY_BUFFER) {
+                for (int j=0; i<LATENCY_BUFFER; j++) {
+                    rte_spinlock_lock(&latency_dump_lock);
+                    fprintf(lat_file, "%lu\n", latency_buffer[j]);
+                    rte_spinlock_unlock(&latency_dump_lock);
+                }
+                latency_counter = 0;
+            }
         }
+
         /* Update RX counters */
         if (packets > 0) {
            atomic_fetch_add(&rx_counter.val, packets);
@@ -419,6 +498,8 @@ lcore_rx_worker(void *arg)
             }
         }
     }
+
+    free(latency_buffer);
 
     return 0;
 }
