@@ -20,6 +20,8 @@
 #include "generator.h"
 #include "rate-limiter.h"
 
+#define FTUPLE_DEF_VAL "6, 192.168.0.1, 10.0.0.1, 100, 200"
+
 static int lcore_tx_worker(void *arg);
 static int lcore_rx_worker(void *arg);
 
@@ -42,25 +44,42 @@ struct worker_settings {
 /* Application arguments and help.
  * Format: name, required, is-boolean, default, help */
 static struct arguments app_args[] = {
-/* Name           R  B  Def     Help */
-{"tx",            1, 0, "0",    "TX port number."},
-{"rx" ,           1, 0, "0",    "RX port number."},
-{"eal",           0, 0, "",     "DPDK EAL arguments."},
-{"txq",           0, 0, "4",    "Number of TX queues."},
-{"rxq",           0, 0, "4",    "Number of RX queues."},
-{"tx-descs",      0, 0, "256",  "Number of TX descs."},
-{"rx-descs",      0, 0, "256",  "Number of RX descs."},
-{"lat-file",      0, 0, NULL,   "Out filename for latency per packet values."},
-{"time-limit",    0, 0, NULL,   "Stop application after VALUE seconds"},
-{"rate-limit",    0, 0, "0",    "If VALUE>0, limites TX rate in Kpps."},
-{"xstats",        0, 1, NULL,   "Show port xstats at the end."},
-{"hide-zeros",    0, 1, NULL,   "(xstats) Hide zero values."},
-{"superspreader", 0, 1, NULL,   "(Policy) Generate packets using a "
-                                "superspreader policy, continuously "
-                                "increaseing dst IP and dst port."},
-{"nflows",        0, 0, "100",  "(Policy:superspreader) Number of unique "
-                                "flows for the superspreader policy."},
-{NULL,            0, 0, NULL,   "Simple DPDK client."}
+/* Name            R  B  Def     Help */
+{"tx",             1, 0, "0",    "TX port number."},
+{"rx" ,            1, 0, "0",    "RX port number."},
+{"eal",            0, 0, "",     "DPDK EAL arguments."},
+{"txq",            0, 0, "4",    "Number of TX queues."},
+{"rxq",            0, 0, "4",    "Number of RX queues."},
+{"tx-descs",       0, 0, "256",  "Number of TX descs."},
+{"rx-descs",       0, 0, "256",  "Number of RX descs."},
+
+/* Output files */
+{"lat-file",       0, 0, NULL,   "Out filename for latency per packet values."},
+
+/* Limiters */
+{"time-limit",     0, 0, "0",    "Stop application after VALUE seconds"},
+{"rate-limit",     0, 0, "0",    "If VALUE>0, limites TX rate in Kpps."},
+
+/* Statistics */
+{"xstats",         0, 1, NULL,   "Show port xstats at the end."},
+{"hide-zeros",     0, 1, NULL,   "(xstats) Hide zero values."},
+
+/* Superspreader / nflows policies */
+{"p-superspreader",0, 1, NULL,   "(Policy) Generate packets using a "
+                                 "superspreader policy, continuously "
+                                 "increaseing dst-ip and dst-port."},
+{"p-nflows",       0, 1, NULL,   "(Policy) Generate packets s.t each packet "
+                                 "is sent with a different src-ip and dst-ip."},
+{"flows",          0, 0, "100",  "(Superspreader / nflows policies) "
+                                 "Number of unique to generate."},
+{"5tuple",         0, 0, FTUPLE_DEF_VAL,
+                                 "(Superspreader / nflows policies) "
+                                 "Base 5-tuple for flow generation."},
+
+/* PCAP policy */
+{"p-pcap",         0, 1, NULL,   "(Policy) Read packets from a PCAP file."},
+{"pcap-name",      0, 0, "",     "(Pcap policy) name of PCAP file to play."},
+{NULL,             0, 0, NULL,   "Simple DPDK client."}
 };
 
 /* Atomic messages accross cores, each a single cache line */
@@ -88,6 +107,22 @@ signal_handler(int signum)
     }
 }
 
+/* Get "ssnf_args" from user */
+static struct ssnf_args
+parse_ssnf_args()
+{
+    struct ssnf_args ssnf_args;
+    const char *ftuple_args;
+
+    ssnf_args.flow_num = ARG_INTEGER(app_args, "flows", 100);
+    ftuple_args = ARG_STRING(app_args, "5tuple", FTUPLE_DEF_VAL);
+    if (ftuple_parse(&ssnf_args.base, ftuple_args)) {
+        printf("Error parsing 5-tuple string \"%s\". Using default.\n",
+               ftuple_args);
+    }
+    return ssnf_args;
+}
+
 /* Parse application arguments */
 static void
 initialize_settings()
@@ -113,22 +148,48 @@ initialize_settings()
 
     /* Set generator policy */
     policy_t policy = POLICY_UNDEFINED;
-    if (ARG_BOOL(app_args, "superspreader", 0)) {
+    if (ARG_BOOL(app_args, "p-superspreader", 0)) {
         policy = POLICY_SUPERSPREADER;
-    }
-
-    if (policy == POLICY_UNDEFINED) {
+    } else if (ARG_BOOL(app_args, "p-nflows", 0)) {
+        policy = POLICY_NFLOWS;
+    } else if (ARG_BOOL(app_args, "p-pcap", 0)) {
+        policy = POLICY_PCAP;
+    } else {
         printf("Packet generation policy was not given. Using default. \n");
     }
 
     switch (policy) {
+    case POLICY_NFLOWS: {
+        struct ssnf_args ssnf_args = parse_ssnf_args();
+        printf("Using n-flows policy with %u flows "
+               "and 5-tuple ", ssnf_args.flow_num);
+        ftuple_print(stdout, &ssnf_args.base);
+        printf("\n");
+        worker_settings.generator = generator_policy_nflows;
+        worker_settings.args = alloc_void_arg_bytes(&ssnf_args,
+                                                    sizeof(ssnf_args));
+        break;
+    }
+    case POLICY_PCAP: {
+        const char *pcap_fname = ARG_STRING(app_args, "pcap-name", "");
+        printf("Using PCAP policy. reading PCAP from \"%s\"\n", pcap_fname);
+        worker_settings.generator = generator_policy_pcap;
+        worker_settings.args = alloc_void_arg_bytes(&pcap_fname,
+                                                    sizeof(char)*
+                                                    (strlen(pcap_fname)+1));
+        break;
+    }
     case POLICY_SUPERSPREADER:
-    default:
-    {
-        uint32_t nflows = ARG_INTEGER(app_args, "nflows", 100);
-        printf("Using superspreader policy with %u flows. \n", nflows);
+    default: {
+        struct ssnf_args ssnf_args = parse_ssnf_args();
+        printf("Using superspreader policy with %u flows "
+               "and 5-tuple ", ssnf_args.flow_num);
+        ftuple_print(stdout, &ssnf_args.base);
+        printf("\n");
         worker_settings.generator = generator_policy_superspreader;
-        worker_settings.args = alloc_void_arg_uint32_t(nflows);
+        worker_settings.args = alloc_void_arg_bytes(&ssnf_args,
+                                                    sizeof(ssnf_args));
+        break;
     }}
 }
 
@@ -336,6 +397,7 @@ lcore_tx_worker(void *arg)
     uint64_t last_ns;
     uint64_t pkt_counter;
     double diff_ns;
+    void *state;
     int socket, core;
     int secs;
 
@@ -352,6 +414,7 @@ lcore_tx_worker(void *arg)
     pkt_counter = 0;
     secs = 0;
     last_ns = get_time_ns();
+    state = worker_settings.args;
 
     /* Allocate memory */
     rte_mempool = create_mempool(socket,
@@ -366,11 +429,11 @@ lcore_tx_worker(void *arg)
 
         /* Generate packet batch based on the 5-tuple */
         for (int i=0; i<BATCH_SIZE; i++) {
-            worker_settings.generator(pkt_counter,
-                                      worker_settings.queue_index,
-                                      worker_settings.tx_queue_num,
-                                      &ftuple,
-                                      worker_settings.args);
+            state = worker_settings.generator(pkt_counter,
+                                              worker_settings.queue_index,
+                                              worker_settings.tx_queue_num,
+                                              &ftuple,
+                                              state); 
             generate_ftuple_packet(rte_mbufs[i],
                                    &tx_settings.mac_addr,
                                    &rx_settings.mac_addr,

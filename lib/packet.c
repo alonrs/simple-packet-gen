@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <string.h>
 #include <rte_byteorder.h>
 #include <rte_ether.h>
 #include <rte_ip.h>
@@ -210,6 +211,89 @@ read_packet(struct rte_mbuf *mbuf, uint64_t *timestamp)
     }
 
     return 0;
+}
+
+int
+ftuple_parse(struct ftuple *ftuple, const char *str)
+{
+    char *buffer;
+    char *ptr;
+    int pos;
+    int ret;
+    long val;
+
+    ret = 1;
+    buffer = malloc(sizeof(char)*(strlen(str)+1));
+    if (!buffer) {
+        goto exit;
+    }
+
+    memcpy(buffer, str, sizeof(char)*(strlen(str)+1));
+    memset(ftuple, 0, sizeof(*ftuple));
+
+    ptr = strtok(buffer, ", .\t");
+    pos = 0;
+
+    while (ptr) {
+        val = atol(ptr);
+
+        /* IP-PROTO / IP Segments */
+        if ((pos <= 8) && ((val < 0 || val > 255))) {
+            goto exit;
+        /* Ports */
+        } else if ((pos < 10) && ((val < 0 || val > (long)0xFFFF))) {
+            goto exit;
+        } else if (pos > 10) {
+            goto exit;
+        }
+
+        switch (pos) {
+        case 0: ftuple->ip_proto = val; break;
+        case 1: ftuple->src_ip |= val << 24; break;
+        case 2: ftuple->src_ip |= val << 16; break;
+        case 3: ftuple->src_ip |= val << 8; break;
+        case 4:
+            ftuple->src_ip |= val << 0;
+            ftuple->src_ip  = rte_cpu_to_be_32(ftuple->src_ip);
+            break;
+        case 5: ftuple->dst_ip |= val << 24; break;
+        case 6: ftuple->dst_ip |= val << 16; break;
+        case 7: ftuple->dst_ip |= val << 8; break;
+        case 8:
+            ftuple->dst_ip |= val << 0;
+            ftuple->dst_ip  = rte_cpu_to_be_32(ftuple->dst_ip);
+            break;
+        case 9: ftuple->src_port = rte_cpu_to_be_16(val); break;
+        case 10: ftuple->dst_port = rte_cpu_to_be_16(val); break;
+        default:
+            goto exit;
+        }
+        ptr = strtok(NULL, ", .\t");
+        pos++;
+    }
+
+    ret = 0;
+exit:
+    free(buffer);
+    return ret;
+}
+
+void
+ftuple_print(FILE *f, struct ftuple *ftuple)
+{
+    uint32_t src_ip = rte_be_to_cpu_32(ftuple->src_ip);
+    uint32_t dst_ip = rte_be_to_cpu_32(ftuple->dst_ip);
+    uint16_t src_port = rte_be_to_cpu_16(ftuple->src_port);
+    uint16_t dst_port = rte_be_to_cpu_16(ftuple->dst_port);
+
+    fprintf(f, "[ip-proto: %u, src-ip: %d.%d.%d.%d, dst-ip: %d.%d.%d.%d, "
+            "src-port: %hu, dst-port: %hu]",
+            ftuple->ip_proto,
+            src_ip >> 24 & 0xFF, src_ip >> 16 & 0xFF,
+            src_ip >> 8  & 0xFF, src_ip & 0xFF,
+            dst_ip >> 24 & 0xFF, dst_ip >> 16 & 0xFF,
+            dst_ip >> 8  & 0xFF, dst_ip & 0xFF,
+            src_port, dst_port);
 }
 
 /* Compute checksum for count bytes starting at addr,

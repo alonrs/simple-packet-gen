@@ -1,6 +1,7 @@
 #ifndef _PACKET_H
 #define _PACKET_H
 
+#include <stdio.h>
 #include <stdbool.h>
 #include <rte_mbuf.h>
 #include <rte_ether.h>
@@ -49,5 +50,14 @@ void generate_ftuple_packet(struct rte_mbuf *mbuf,
 /* Reads a single packet from "mbuf", returns its timestamp into "timestamp".
  * Returns 0 on valid packet. */
 int read_packet(struct rte_mbuf *mbuf, uint64_t *timestamp);
+
+/* Parses "str" into the 5-tuple "ftuple". Returns 0 on success.
+ * "str" format: IP_PROTO,SRC-IP,DST-IP,SRC-PORT,DST-PORT
+ * (delimiter can also be ' ' or '\t')
+ */
+int ftuple_parse(struct ftuple *ftuple, const char *str);
+
+/* Print 5-tuple to file */
+void ftuple_print(FILE *f, struct ftuple *ftuple);
 
 #endif
