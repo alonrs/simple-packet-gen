@@ -18,6 +18,7 @@
 #include "packet.h"
 #include "device.h"
 #include "generator.h"
+#include "rate-limiter.h"
 
 static int lcore_tx_worker(void *arg);
 static int lcore_rx_worker(void *arg);
@@ -35,6 +36,7 @@ struct worker_settings {
     uint16_t tx_queue_num;
     uint16_t rx_queue_num;
     int time_limit;
+    int rate_limit;
 };
 
 /* Application arguments and help.
@@ -50,6 +52,7 @@ static struct arguments app_args[] = {
 {"rx-descs",      0, 0, "256",  "Number of RX descs."},
 {"lat-file",      0, 0, NULL,   "Out filename for latency per packet values."},
 {"time-limit",    0, 0, NULL,   "Stop application after VALUE seconds"},
+{"rate-limit",    0, 0, "0",    "If VALUE>0, limites TX rate in Kpps."},
 {"xstats",        0, 1, NULL,   "Show port xstats at the end."},
 {"hide-zeros",    0, 1, NULL,   "(xstats) Hide zero values."},
 {"superspreader", 0, 1, NULL,   "(Policy) Generate packets using a "
@@ -106,6 +109,7 @@ initialize_settings()
     worker_settings.rx_queue_num = rx_settings.rx_queues;
     worker_settings.collect_latency_stats = ARG_BOOL(app_args, "lat-file", 0);
     worker_settings.time_limit = ARG_INTEGER(app_args, "time-limit", 0);
+    worker_settings.rate_limit = ARG_INTEGER(app_args, "rate-limit", 0);
 
     /* Set generator policy */
     policy_t policy = POLICY_UNDEFINED;
@@ -203,10 +207,8 @@ main(int argc, char *argv[])
     uint32_t nb_ports;
     uint32_t lcore_id;
     uint32_t socket;
-    uint16_t portid;
     uint16_t tx_workers;
     uint16_t rx_workers;
-    int i;
 
     /* Parse application argumnets, initialize */
     arg_parse(argc, argv, app_args);
@@ -328,6 +330,7 @@ lcore_tx_worker(void *arg)
     struct worker_settings worker_settings;
     struct rte_mempool *rte_mempool;
     struct rte_mbuf *rte_mbufs[BATCH_SIZE];
+    struct rate_limiter rate_limiter;
     struct ftuple ftuple;
     uint16_t retval;
     uint64_t last_ns;
@@ -340,6 +343,10 @@ lcore_tx_worker(void *arg)
                        arg,
                        sizeof(worker_settings),
                        true);
+    rate_limiter_init(&rate_limiter,
+                      worker_settings.rate_limit,
+                      BATCH_SIZE,
+                      worker_settings.tx_queue_num);
     socket = rte_socket_id();
     core = rte_lcore_id();
     pkt_counter = 0;
@@ -397,11 +404,14 @@ lcore_tx_worker(void *arg)
                 /* Time limit */
                 if (worker_settings.time_limit &&
                     secs >= worker_settings.time_limit) {
-                    printf("Time limit have reached \n");
+                    printf("Time limit has reached \n");
                     atomic_store(&running.val, false);
                 }
             }
         }
+
+        /* Rate limiter */
+        rate_limiter_wait(&rate_limiter);
     }
 
     return 0;
