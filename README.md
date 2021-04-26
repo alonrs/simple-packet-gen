@@ -1,9 +1,11 @@
 # General Info
 
-Simple DPDK client is a native app for sending raw ethernet packets on a PCI network device using DPDK. It comes with three included packet generator modes, and can be easily extended to support more.
+Simple packet-gen is a native app for sending raw ethernet packets on a PCI network device using DPDK. It comes with three included packet generator modes, and can be easily extended to support more.
+
+![screenshot](screenshot.gif)
 
 # Prerequisits
-1. DPDK supported NIC (tested with *Intel E810-C*, *Intel X540-AT2*, *Mellanox CX4*)
+1. A DPDK supported NIC (tested with *Intel E810-C*, *Intel X540-AT2*, *Mellanox CX4*)
 2. A Linux operating system (tested with Ubuntu 18.04)
 3. Sudo permissions
 4. Meson and ninja tools for building DPDK (both require Python 3.6 or later)
