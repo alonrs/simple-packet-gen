@@ -26,7 +26,7 @@ static void compute_icmp_checksum(struct rte_ipv4_hdr *ipv4_hdr);
 /* Fills "mbuf" with a single IPV4 packet of "size" bytes with
  * "ftuple" 5-tuple header info */
 void
-generate_ftuple_packet(struct rte_mbuf *mbuf,
+generate_packet_ftuple(struct rte_mbuf *mbuf,
                        struct rte_ether_addr *src_mac,
                        struct rte_ether_addr *dst_mac,
                        int size,
@@ -161,6 +161,24 @@ generate_ftuple_packet(struct rte_mbuf *mbuf,
         printf("\n");
     }
 
+    mbuf->data_len = size;
+    mbuf->pkt_len = size;
+}
+
+/* Fills "mbuf" with raw packet bytes from "bytes" with size "size" */
+void
+generate_packet_raw(struct rte_mbuf *mbuf, const char *bytes, size_t size)
+{
+    char *dst;
+
+    rte_pktmbuf_reset(mbuf);
+
+    if (!rte_pktmbuf_is_contiguous(mbuf)) {
+        printf("mbuf is not contiguous\n");
+    }
+
+    dst = rte_pktmbuf_mtod(mbuf, char*);
+    memcpy(dst, bytes, size);
     mbuf->data_len = size;
     mbuf->pkt_len = size;
 }

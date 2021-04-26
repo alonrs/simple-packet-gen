@@ -33,6 +33,7 @@ ifneq ($(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
 $(error "No installation of DPDK found. Did you run build.sh?")
 endif
 
+LDFLAGS:=-lm -lpcap
 LDFLAGS+=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
                  $(PKGCONF) --libs libdpdk)
 CFLAGS +=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \

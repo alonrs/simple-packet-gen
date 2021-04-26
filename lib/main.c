@@ -7,7 +7,7 @@
 #include <string.h>
 #include <signal.h>
 #include <netinet/in.h>
-
+#include <pcap/pcap.h>
 #include <rte_ethdev.h>
 #include <rte_spinlock.h>
 
@@ -30,6 +30,7 @@ enum { MAX_EAL_ARGS = 64 };
 /* Passed to worker threads */
 struct worker_settings {
     generator_policy_func_t generator; /* Packet generator */
+    generator_mode_t generator_mode;
     void *args;                        /* Generator custom arguments */
     bool collect_latency_stats;
     uint16_t tx_leader_core_id;
@@ -166,6 +167,7 @@ initialize_settings()
         ftuple_print(stdout, &ssnf_args.base);
         printf("\n");
         worker_settings.generator = generator_policy_nflows;
+        worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
         worker_settings.args = alloc_void_arg_bytes(&ssnf_args,
                                                     sizeof(ssnf_args));
         break;
@@ -174,9 +176,8 @@ initialize_settings()
         const char *pcap_fname = ARG_STRING(app_args, "pcap-name", "");
         printf("Using PCAP policy. reading PCAP from \"%s\"\n", pcap_fname);
         worker_settings.generator = generator_policy_pcap;
-        worker_settings.args = alloc_void_arg_bytes(&pcap_fname,
-                                                    sizeof(char)*
-                                                    (strlen(pcap_fname)+1));
+        worker_settings.generator_mode = GENERATOR_OUT_RAW;
+        worker_settings.args = (void*)pcap_fname;
         break;
     }
     case POLICY_SUPERSPREADER:
@@ -187,6 +188,7 @@ initialize_settings()
         ftuple_print(stdout, &ssnf_args.base);
         printf("\n");
         worker_settings.generator = generator_policy_superspreader;
+        worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
         worker_settings.args = alloc_void_arg_bytes(&ssnf_args,
                                                     sizeof(ssnf_args));
         break;
@@ -384,96 +386,315 @@ main(int argc, char *argv[])
     return 0;
 }
 
-/* Main TX worker */
-static int
-lcore_tx_worker(void *arg)
+/* Generate a packet batch acording to "worker_settings", fill "rte_mbufs".
+ * The generator state "gen_state" is both read and updated.
+ * Method is inline for compiler optimizations with "batch_size" */
+static inline void
+tx_generate_batch(struct rte_mbuf **rte_mbufs,
+                  struct worker_settings *worker_settings,
+                  void **gen_state,
+                  uint64_t *packet_counter,
+                  const int batch_size)
 {
-    struct worker_settings worker_settings;
-    struct rte_mempool *rte_mempool;
-    struct rte_mbuf *rte_mbufs[BATCH_SIZE];
-    struct rate_limiter rate_limiter;
-    struct ftuple ftuple;
-    uint16_t retval;
-    uint64_t last_ns;
-    uint64_t pkt_counter;
-    double diff_ns;
-    void *state;
-    int socket, core;
-    int secs;
+    void *gen_data;
 
-    get_void_arg_bytes(&worker_settings,
-                       arg,
-                       sizeof(worker_settings),
-                       true);
-    rate_limiter_init(&rate_limiter,
-                      worker_settings.rate_limit,
-                      BATCH_SIZE,
-                      worker_settings.tx_queue_num);
-    socket = rte_socket_id();
-    core = rte_lcore_id();
-    pkt_counter = 0;
-    secs = 0;
-    last_ns = get_time_ns();
-    state = worker_settings.args;
+    /* Initiate state */
+    if (!*packet_counter) {
+        *gen_state = worker_settings->args;
+    }
+
+    /* Generate packet batch based on the 5-tuple */
+    for (int i=0; i<batch_size; i++) {
+        *gen_state = worker_settings->generator(*packet_counter,
+                                                worker_settings->queue_index,
+                                                worker_settings->tx_queue_num,
+                                                *gen_state,
+                                                &gen_data);
+
+        /* Fill "rte_mbufs[i]" with data according to the generator mode */
+        if (worker_settings->generator_mode == GENERATOR_OUT_FTUPLE) {
+            generate_packet_ftuple(rte_mbufs[i],
+                                   &tx_settings.mac_addr,
+                                   &rx_settings.mac_addr,
+                                   PACKET_SIZE,
+                                   (struct ftuple*)gen_data,
+                                   (worker_settings->queue_index==0) &&
+                                   DEBUG_PRINT_PACKETS);
+        } else if (worker_settings->generator_mode == GENERATOR_OUT_RAW) {
+            generate_packet_raw(rte_mbufs[i],
+                                ((struct raw_packet*)gen_data)->bytes,
+                                ((struct raw_packet*)gen_data)->size);
+        }
+        (*packet_counter)++;
+    }
+}
+
+/* Sends "batch_size" packet from "rte_mbufs" according to "worker_settings".
+ * Method is inline for compiler optimizations with "batch_size" */
+static inline void
+tx_send_batch(struct rte_mbuf **rte_mbufs,
+              struct worker_settings *worker_settings,
+              const int batch_size)
+{
+    uint16_t retval;
+
+    /* Send packets */
+    retval = rte_eth_tx_burst(tx_settings.port_id,
+                              worker_settings->queue_index,
+                              rte_mbufs,
+                              batch_size);
+
+    /* Update TX counter */
+    if (retval > 0) {
+        atomic_fetch_add(&tx_counter.val, retval);
+    }
+}
+
+/* Prints TX counter to stdout, only from the TX leader core */
+static void
+tx_show_counter(const int socket,
+                const int core,
+                const struct worker_settings *worker_settings,
+                int *sec_counter)
+{
+    static uint64_t last_timestamp = 0;
+    double diff_ns;
+    double mpps;
+    long counter;
+
+    /* Leader prints to screen */
+    if (core != worker_settings->tx_leader_core_id) {
+        return;
+    }
+
+    if (!last_timestamp) {
+        last_timestamp = get_time_ns();
+    }
+
+    diff_ns = get_time_ns() - last_timestamp;
+    if (diff_ns < 1e9) {
+        return;
+    }
+
+    counter = atomic_exchange(&tx_counter.val, 0);
+    mpps = (double)counter/1e6/(diff_ns/1e9);
+
+    printf("TX %.4lf Mpps\n", mpps);
+
+    last_timestamp = get_time_ns();
+    (*sec_counter)++;
+
+    /* Time limit */
+    if (worker_settings->time_limit &&
+        (*sec_counter) >= worker_settings->time_limit) {
+        printf("Time limit has reached \n");
+        atomic_store(&running.val, false);
+    }
+}
+
+/* Allocate mbufs for TX */
+static inline void
+tx_allocate_mbufs(int socket,
+                  struct rte_mbuf **rte_mbufs,
+                  const int batch_size)
+{
+    struct rte_mempool *rte_mempool;
+    uint16_t retval;
 
     /* Allocate memory */
     rte_mempool = create_mempool(socket,
                                  DEVICE_MEMPOOL_DEF_SIZE,
                                  tx_settings.tx_descs*2);
-    retval = rte_pktmbuf_alloc_bulk(rte_mempool, rte_mbufs, BATCH_SIZE);
+    retval = rte_pktmbuf_alloc_bulk(rte_mempool, rte_mbufs, batch_size);
     if (retval) {
         rte_exit(EXIT_FAILURE, "Failed to allocate mbuf \n");
     }
+}
+
+/* Receive a "batch_size" incoming packets into "rte_mbufs" according to the
+ * settings defined in "worker_settings", and update the global counters.
+ * Returns the number of received packets.
+ * The method is inline for compiler optimizations. */
+static inline int
+rx_receive_batch(const struct worker_settings *worker_settings,
+                 struct rte_mbuf **rte_mbufs,
+                 const int batch_size)
+{
+    uint16_t packets;
+
+    packets = rte_eth_rx_burst(rx_settings.port_id,
+                               worker_settings->queue_index,
+                               rte_mbufs,
+                               batch_size);
+
+    /* Update RX counters */
+    if (packets > 0) {
+       atomic_fetch_add(&rx_counter.val, packets);
+    }
+
+    return packets;
+}
+
+/* Reads "num_packets" from "rte_mbufs" according to the settings defined in
+ * "worker_settings", and update global RX counters. In case the latencies
+ * need to be collected, they will be pushed into "vector" every "gap" packets.
+ */
+static void
+rx_parse_packets(const struct worker_settings *worker_settings,
+                 struct rte_mbuf **rte_mbufs,
+                 const int num_packets,
+                 const int gap,
+                 struct vector *vector)
+{
+    uint64_t timestamp;
+    uint64_t current_ns;
+    uint64_t latency_ns;
+    uint64_t diff_total;
+    int retval;
+    int err_counter;
+    int diff_counter;
+
+    current_ns = get_time_ns();
+    err_counter = 0;
+    diff_counter = 0;
+    diff_total = 0;
+
+    /* Read incoming packets, uppdate latency vector and global counters */
+    for (int i=0; i<num_packets; i++) {
+        retval = read_packet(rte_mbufs[i], &timestamp);
+        if (retval) {
+            err_counter++;
+            continue;
+        }
+
+        /* Update local stats */
+        latency_ns = current_ns - timestamp;
+        diff_total += latency_ns;
+        diff_counter++;
+
+        if (!worker_settings->collect_latency_stats) {
+            continue;
+        }
+
+        /* Update local vector every LATENCY_COLLECTOR_GAP packets */
+        if (i%gap==0) {
+            vector_push(vector, &latency_ns);
+        }
+    }
+
+    /* Update global error counter */
+    if (err_counter > 0) {
+        atomic_fetch_add(&rx_err_counter.val, err_counter);
+    }
+
+    /* Update latency counters */
+    if (diff_counter > 0) {
+        rte_spinlock_lock(&latency_lock);
+        atomic_fetch_add(&latency_total, diff_total);
+        atomic_fetch_add(&latency_counter, diff_counter);
+        rte_spinlock_unlock(&latency_lock);
+    }
+}
+
+/* Free the mbufs memory */
+static inline void
+rx_free_memory(struct rte_mbuf **rte_mbufs,
+               const int num_packets)
+{
+    for (int i=0; i<num_packets; i++) {
+        rte_pktmbuf_free(rte_mbufs[i]);
+    }
+}
+
+/* Prints RX counter to stdout, only from the RX leader core */
+static void
+rx_show_counter(const int core,
+                const struct worker_settings *worker_settings)
+{
+    static uint64_t last_timestamp = 0;
+    double diff_ns;
+    double mpps;
+    double avg_latency_usec;
+    long counter;
+    long err_counter;
+    long diff_total;
+    long diff_counter;
+
+    /* Leader prints to screen */
+    if (core != worker_settings->rx_leader_core_id) {
+        return;
+    }
+
+    if (!last_timestamp) {
+        last_timestamp = get_time_ns();
+    }
+
+    diff_ns = get_time_ns() - last_timestamp;
+    if (diff_ns < 1e9) {
+        return;
+    }
+
+    counter = atomic_exchange(&rx_counter.val, 0);
+    mpps = (double)counter/1e6/(diff_ns/1e9);
+    err_counter = atomic_exchange(&rx_err_counter.val, 0);
+
+    /* Calc avg latency */
+    rte_spinlock_lock(&latency_lock);
+    diff_total = atomic_exchange(&latency_total, 0);
+    diff_counter = atomic_exchange(&latency_counter, 0);
+    avg_latency_usec = (diff_counter == 0) ? 0 :
+            (double)diff_total / diff_counter / 1e3;
+    rte_spinlock_unlock(&latency_lock);
+
+    printf("RX %.4lf Mpps, errors: %lu, avg. latency %.1lf usec\n",
+           mpps, err_counter, avg_latency_usec);
+    last_timestamp = get_time_ns();
+}
+
+/* Main TX worker */
+static int
+lcore_tx_worker(void *arg)
+{
+    struct worker_settings worker_settings;
+    struct rte_mbuf *rte_mbufs[BATCH_SIZE];
+    struct rate_limiter rate_limiter;
+    uint64_t pkt_counter;
+    int socket, core;
+    int sec_counter;
+    void *gen_state;
+
+    socket = rte_socket_id();
+    core = rte_lcore_id();
+    pkt_counter = 0;
+    sec_counter = 0;
+    gen_state = NULL;
+
+    get_void_arg_bytes(&worker_settings,
+                       arg,
+                       sizeof(worker_settings),
+                       true);
+
+    rate_limiter_init(&rate_limiter,
+                      worker_settings.rate_limit,
+                      BATCH_SIZE,
+                      worker_settings.tx_queue_num);
+
+    tx_allocate_mbufs(socket, rte_mbufs, BATCH_SIZE);
 
     while(running.val) {
+        tx_generate_batch(rte_mbufs,
+                          &worker_settings,
+                          &gen_state,
+                          &pkt_counter,
+                          BATCH_SIZE);
 
-        /* Generate packet batch based on the 5-tuple */
-        for (int i=0; i<BATCH_SIZE; i++) {
-            state = worker_settings.generator(pkt_counter,
-                                              worker_settings.queue_index,
-                                              worker_settings.tx_queue_num,
-                                              &ftuple,
-                                              state); 
-            generate_ftuple_packet(rte_mbufs[i],
-                                   &tx_settings.mac_addr,
-                                   &rx_settings.mac_addr,
-                                   PACKET_SIZE,
-                                   &ftuple,
-                                   (worker_settings.queue_index==0) &&
-                                   DEBUG_PRINT_PACKETS);
-            pkt_counter++;
-        }
+        tx_send_batch(rte_mbufs, &worker_settings, BATCH_SIZE);
 
-        /* Send packets */
-        retval = rte_eth_tx_burst(tx_settings.port_id,
-                                  worker_settings.queue_index,
-                                  rte_mbufs,
-                                  BATCH_SIZE);
+        tx_show_counter(socket,
+                        core,
+                        &worker_settings,
+                        &sec_counter);
 
-        /* Update TX counter */
-        if (retval > 0) {
-            atomic_fetch_add(&tx_counter.val, retval);
-        }
-
-        /* Leader prints to screen */
-        if (core == worker_settings.tx_leader_core_id) {
-            diff_ns = get_time_ns() - last_ns;
-            if (diff_ns > 1e9) {
-                long counter = atomic_exchange(&tx_counter.val, 0);
-                double mpps = (double)counter/1e6/(diff_ns/1e9);
-                printf("TX %.4lf Mpps\n", mpps);
-                last_ns = get_time_ns();
-                secs++;
-                /* Time limit */
-                if (worker_settings.time_limit &&
-                    secs >= worker_settings.time_limit) {
-                    printf("Time limit has reached \n");
-                    atomic_store(&running.val, false);
-                }
-            }
-        }
-
-        /* Rate limiter */
         rate_limiter_wait(&rate_limiter);
     }
 
@@ -486,103 +707,45 @@ lcore_rx_worker(void *arg)
 {
     struct rte_mbuf *rte_mbufs[BATCH_SIZE];
     struct worker_settings worker_settings;
-    uint64_t last_ns, current_ns, diff_ns;
-    uint64_t latency_ns, timestamp;
-    long diff_counter, diff_total;
-    long counter, err_counter;
-    struct vector *local_vector;
-    uint16_t packets;
+    struct vector *vector;
+    int packets;
     int core;
-    int retval;
 
     get_void_arg_bytes(&worker_settings,
                        arg,
                        sizeof(worker_settings),
                        true);
     core = rte_lcore_id();
-    last_ns = get_time_ns();
-
     /* Local vector for latency values */
-    local_vector = vector_init(sizeof(uint64_t));
+    vector = vector_init(sizeof(uint64_t));
 
     while(running.val) {
-
         /* Get a batch of packets */
-        packets = rte_eth_rx_burst(rx_settings.port_id,
-                                   worker_settings.queue_index,
+        packets = rx_receive_batch(&worker_settings,
                                    rte_mbufs,
                                    BATCH_SIZE);
 
-        diff_total = 0;
-        diff_counter = 0;
-        err_counter = 0;
-        current_ns = get_time_ns();
+        /* Parse packets, update latency vector */
+        rx_parse_packets(&worker_settings,
+                        rte_mbufs,
+                        packets,
+                        LATENCY_COLLECTOR_GAP,
+                        vector);
 
-        /* Check timestamps, update latency, free memory */
-        for (uint16_t i=0; i<packets; i++) {
-            retval = read_packet(rte_mbufs[i], &timestamp);
-            rte_pktmbuf_free(rte_mbufs[i]);
-            if (retval) {
-                err_counter++;
-                continue;
-            }
-            /* Update local stats */
-            latency_ns = current_ns - timestamp;
-            diff_total += latency_ns;
-            diff_counter++;
-            /* Update local vector every LATENCY_COLLECTOR_GAP packets */
-            if(worker_settings.collect_latency_stats &&
-              (i%LATENCY_COLLECTOR_GAP==0)) {
-                vector_push(local_vector, &latency_ns);
-            }
-        }
-
-        /* Update RX counters */
-        if (packets > 0) {
-           atomic_fetch_add(&rx_counter.val, packets);
-        }
-        if (err_counter > 0) {
-            atomic_fetch_add(&rx_err_counter.val, err_counter);
-        }
-
-        /* Update latency counters */
-        if (diff_counter > 0) {
-            rte_spinlock_lock(&latency_lock);
-            atomic_fetch_add(&latency_total, diff_total);
-            atomic_fetch_add(&latency_counter, diff_counter);
-            rte_spinlock_unlock(&latency_lock);
-        }
+        /* Free allocated memory */
+        rx_free_memory(rte_mbufs, packets);
 
         /* Leader prints to screen */
-        if (core == worker_settings.rx_leader_core_id) {
-            diff_ns = get_time_ns() - last_ns;
-            if (diff_ns > 1e9) {
-                /* Calculate RX, RX errors */
-                counter = atomic_exchange(&rx_counter.val, 0);
-                double mpps = (double)counter/1e6/(diff_ns/1e9);
-                err_counter = atomic_exchange(&rx_err_counter.val, 0);
-
-                /* Calc avg latency */
-                rte_spinlock_lock(&latency_lock);
-                diff_total = atomic_exchange(&latency_total, 0);
-                diff_counter = atomic_exchange(&latency_counter, 0);
-                double avg_latency_usec = (diff_counter == 0) ? 0 :
-                        (double)diff_total / diff_counter / 1e3;
-                rte_spinlock_unlock(&latency_lock);
-
-                printf("RX %.4lf Mpps, errors: %lu, avg. latency %.1lf usec\n",
-                       mpps, err_counter, avg_latency_usec);
-                last_ns = get_time_ns();
-            }
-        }
+        rx_show_counter(core,
+                        &worker_settings);
     }
 
     /* Push values from local vector into the global vector */
     uint64_t val;
-    VECTOR_FOR_EACH(local_vector, val, uint64_t) {
+    VECTOR_FOR_EACH(vector, val, uint64_t) {
         vector_push(latency_vector, &val);
     }
-    vector_destroy(local_vector);
+    vector_destroy(vector);
 
     return 0;
 }

@@ -40,12 +40,16 @@ get_port(uint16_t port)
 
 /* Fills "mbuf" with a single IPV4 packet of "size" bytes with
  * "ftuple" 5-tuple header info */
-void generate_ftuple_packet(struct rte_mbuf *mbuf,
+void generate_packet_ftuple(struct rte_mbuf *mbuf,
                             struct rte_ether_addr *src_mac,
                             struct rte_ether_addr *dst_mac,
                             int size,
                             struct ftuple *ftuple,
                             bool print_packet);
+
+/* Fills "mbuf" with raw packet bytes from "bytes" with size "size" */
+void generate_packet_raw(struct rte_mbuf *mbuf, const char *bytes, size_t size);
+
 
 /* Reads a single packet from "mbuf", returns its timestamp into "timestamp".
  * Returns 0 on valid packet. */
