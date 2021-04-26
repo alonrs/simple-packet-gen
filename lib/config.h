@@ -9,7 +9,8 @@
 #define PACKET_TTL 64
 #define PACKET_SIZE 64
 
-#define BATCH_SIZE 64
+/* Maximum available batch size */
+#define MAX_BATCH_SIZE 64
 
 /* Gap between packets for latency value collection */
 #define LATENCY_COLLECTOR_GAP 24

@@ -30,16 +30,18 @@ enum { MAX_EAL_ARGS = 64 };
 /* Passed to worker threads */
 struct worker_settings {
     generator_policy_func_t generator; /* Packet generator */
-    generator_mode_t generator_mode;
+    generator_mode_t generator_mode;   /* RAW or 5-tuples */
     void *args;                        /* Generator custom arguments */
+    int time_limit;                    /* Zero stands for no limit */
+    int rate_limit;                    /* Zero stands for no limit */
+    bool pingpong;                     /* See arguments help for pingpong */
     bool collect_latency_stats;
     uint16_t tx_leader_core_id;
     uint16_t rx_leader_core_id;
     uint16_t queue_index;
     uint16_t tx_queue_num;
     uint16_t rx_queue_num;
-    int time_limit;
-    int rate_limit;
+    uint16_t batch_size;
 };
 
 /* Application arguments and help.
@@ -53,6 +55,17 @@ static struct arguments app_args[] = {
 {"rxq",            0, 0, "4",    "Number of RX queues."},
 {"tx-descs",       0, 0, "256",  "Number of TX descs."},
 {"rx-descs",       0, 0, "256",  "Number of RX descs."},
+{"batch-size",     0, 0, "64",   "Batch size for sending packets."},
+
+/* Special modes */
+{"ping-pong",      0, 1, NULL,  "Enable ping-pong mode. The TX and RX tasks "
+                                "are performed serially on the same core. "
+                                "Packets are sent one-by-one only after the "
+                                "previous sent packet is received. "
+                                "Latency is measured directly, not using "
+                                "timstamps on the packets' payloads. This more "
+                                "uses only 1 RX/TX queue, regardless of 'rxq' "
+                                "and 'txq' parameters."},
 
 /* Output files */
 {"lat-file",       0, 0, NULL,   "Out filename for latency per packet values."},
@@ -80,7 +93,12 @@ static struct arguments app_args[] = {
 /* PCAP policy */
 {"p-pcap",         0, 1, NULL,   "(Policy) Read packets from a PCAP file."},
 {"pcap-name",      0, 0, "",     "(Pcap policy) name of PCAP file to play."},
-{NULL,             0, 0, NULL,   "Simple DPDK client."}
+
+/* Sentinel */
+{NULL,             0, 0, NULL,   "Send and receive packets using DPDK. "
+                                 "Supports several packet generation policies. "
+                                 "See 'generator.h' for supporting more "
+                                 "generation policies."}
 };
 
 /* Atomic messages accross cores, each a single cache line */
@@ -88,10 +106,12 @@ MESSAGE_T(bool, running);
 MESSAGE_T(long, tx_counter);
 MESSAGE_T(long, rx_counter);
 MESSAGE_T(long, rx_err_counter);
+MESSAGE_T(int, pingpong_send);
 
 rte_spinlock_t latency_lock;
 atomic_long latency_counter;
 atomic_long latency_total;
+atomic_long pingpong_timestamp;
 static struct vector *latency_vector;
 
 static struct port_settings tx_settings;
@@ -146,6 +166,26 @@ initialize_settings()
     worker_settings.collect_latency_stats = ARG_BOOL(app_args, "lat-file", 0);
     worker_settings.time_limit = ARG_INTEGER(app_args, "time-limit", 0);
     worker_settings.rate_limit = ARG_INTEGER(app_args, "rate-limit", 0);
+    worker_settings.batch_size = ARG_INTEGER(app_args, "batch-size", 64);
+    worker_settings.pingpong = false;
+
+    /* Check batch size is valid */
+    if (worker_settings.batch_size > MAX_BATCH_SIZE) {
+        printf("Batch size %hu is larger than maximum allowed (%d). "
+               "Setting batch size to %d. \n",
+               worker_settings.batch_size,
+               MAX_BATCH_SIZE,
+               MAX_BATCH_SIZE);
+    }
+
+    /* Do we operate in "ping-pong" mode? */
+    if (ARG_BOOL(app_args, "ping-pong", 0)) {
+        printf("Operating in ping-pong mode\n");
+        tx_settings.tx_queues = 1;
+        rx_settings.rx_queues = 1;
+        worker_settings.pingpong = true;
+        worker_settings.batch_size = 1;
+    }
 
     /* Set generator policy */
     policy_t policy = POLICY_UNDEFINED;
@@ -264,54 +304,14 @@ save_latency_file()
     fclose(file);
 }
 
-int
-main(int argc, char *argv[])
+/* Starts lcore workers. Normal operation mode */
+static void
+workers_start_normal()
 {
-    uint32_t nb_ports;
     uint32_t lcore_id;
     uint32_t socket;
     uint16_t tx_workers;
     uint16_t rx_workers;
-
-    /* Parse application argumnets, initialize */
-    arg_parse(argc, argv, app_args);
-    initialize_settings(argc, argv);
-    initialize_dpdk();
-
-    /* Initialize signal handler */
-    atomic_init(&running.val, true);
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-
-    /* Initialize counters, locks */
-    atomic_init(&tx_counter.val, 0);
-    atomic_init(&rx_counter.val, 0);
-    atomic_init(&rx_err_counter.val, 0);
-    atomic_init(&latency_counter, 0);
-    atomic_init(&latency_total, 0);
-    rte_spinlock_init(&latency_lock);
-    latency_vector = vector_init(sizeof(struct vector*));
-
-    /* Check that there is an even number of ports to send/receive on. */
-    nb_ports = rte_eth_dev_count_avail();
-    if (nb_ports < 2) {
-        rte_exit(EXIT_FAILURE, "Error: number of ports is not 2. "
-                 "Use the EAL -a option to filter PCI addresses.\n");
-    } else if (nb_ports > 2) {
-        printf("Warning: got more than two ports; using first two.\n");
-    }
-
-    /* Initialize ports */
-    if (port_init(&tx_settings)) {
-        rte_exit(EXIT_FAILURE,
-                 "Cannot init port %" PRIu16 "\n",
-                 tx_settings.port_id);
-    }
-    if (port_init(&rx_settings)) {
-        rte_exit(EXIT_FAILURE,
-                 "Cannot init port %" PRIu16 "\n",
-                 rx_settings.port_id);
-    }
 
     tx_workers=0;
     rx_workers=0;
@@ -371,6 +371,51 @@ main(int argc, char *argv[])
     RTE_LCORE_FOREACH_SLAVE(lcore_id) {
         rte_eal_wait_lcore(lcore_id);
     }
+}
+
+int
+main(int argc, char *argv[])
+{
+    /* Parse application argumnets, initialize */
+    arg_parse(argc, argv, app_args);
+    initialize_settings(argc, argv);
+    initialize_dpdk();
+
+    /* Initialize signal handler */
+    atomic_init(&running.val, true);
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+
+    /* Initialize counters, locks */
+    atomic_init(&tx_counter.val, 0);
+    atomic_init(&rx_counter.val, 0);
+    atomic_init(&rx_err_counter.val, 0);
+    atomic_init(&latency_counter, 0);
+    atomic_init(&latency_total, 0);
+    atomic_init(&pingpong_timestamp, 0);
+    atomic_init(&pingpong_send.val, 1);
+    rte_spinlock_init(&latency_lock);
+    latency_vector = vector_init(sizeof(struct vector*));
+
+    /* Check that there is an even number of ports to send/receive on. */
+    if (rte_eth_dev_count_avail() < 2) {
+        rte_exit(EXIT_FAILURE, "Error: number of ports is not 2. "
+                 "Use the EAL -w option to filter PCI addresses.\n");
+    }
+
+    /* Initialize ports */
+    if (port_init(&tx_settings)) {
+        rte_exit(EXIT_FAILURE,
+                 "Cannot init port %" PRIu16 "\n",
+                 tx_settings.port_id);
+    }
+    if (port_init(&rx_settings)) {
+        rte_exit(EXIT_FAILURE,
+                 "Cannot init port %" PRIu16 "\n",
+                 rx_settings.port_id);
+    }
+
+    workers_start_normal();
 
     /* Show xstats */
     bool xstats = ARG_BOOL(app_args, "xstats", false);
@@ -430,19 +475,31 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
 }
 
 /* Sends "batch_size" packet from "rte_mbufs" according to "worker_settings".
- * Method is inline for compiler optimizations with "batch_size" */
+ * Method is inline for compiler optimizations. */
 static inline void
 tx_send_batch(struct rte_mbuf **rte_mbufs,
-              struct worker_settings *worker_settings,
-              const int batch_size)
+              struct worker_settings *worker_settings)
 {
+    uint64_t timestamp;
     uint16_t retval;
+
+    /* If we're in pingpong mode, don't send packets unless we have an okay */
+    if (worker_settings->pingpong && !pingpong_send.val) {
+        return;
+    }
 
     /* Send packets */
     retval = rte_eth_tx_burst(tx_settings.port_id,
                               worker_settings->queue_index,
                               rte_mbufs,
-                              batch_size);
+                              worker_settings->batch_size);
+
+    /* In pingpong mode, update that we're waiting for an okay */
+    if (worker_settings->pingpong) {
+        atomic_store(&pingpong_send.val, 0);
+        timestamp = get_time_ns();
+        atomic_store(&pingpong_timestamp, timestamp);
+    }
 
     /* Update TX counter */
     if (retval > 0) {
@@ -517,19 +574,23 @@ tx_allocate_mbufs(int socket,
  * The method is inline for compiler optimizations. */
 static inline int
 rx_receive_batch(const struct worker_settings *worker_settings,
-                 struct rte_mbuf **rte_mbufs,
-                 const int batch_size)
+                 struct rte_mbuf **rte_mbufs)
 {
     uint16_t packets;
 
     packets = rte_eth_rx_burst(rx_settings.port_id,
                                worker_settings->queue_index,
                                rte_mbufs,
-                               batch_size);
+                               MAX_BATCH_SIZE);
 
     /* Update RX counters */
     if (packets > 0) {
        atomic_fetch_add(&rx_counter.val, packets);
+    }
+
+    /* Update pingpong lock if enabled */
+    if (packets && worker_settings->pingpong) {
+        atomic_store(&pingpong_send.val, 1);
     }
 
     return packets;
@@ -538,6 +599,9 @@ rx_receive_batch(const struct worker_settings *worker_settings,
 /* Reads "num_packets" from "rte_mbufs" according to the settings defined in
  * "worker_settings", and update global RX counters. In case the latencies
  * need to be collected, they will be pushed into "vector" every "gap" packets.
+ * if "override_timestamp" is not NULL, the latency is extracted from the
+ * incoming packets. Otherwise, it will be calculated in respect to the value in
+ * "override_timestamp".
  */
 static void
 rx_parse_packets(const struct worker_settings *worker_settings,
@@ -553,15 +617,23 @@ rx_parse_packets(const struct worker_settings *worker_settings,
     int retval;
     int err_counter;
     int diff_counter;
-
+    
     current_ns = get_time_ns();
     err_counter = 0;
     diff_counter = 0;
     diff_total = 0;
+    retval = 0;
 
     /* Read incoming packets, uppdate latency vector and global counters */
     for (int i=0; i<num_packets; i++) {
-        retval = read_packet(rte_mbufs[i], &timestamp);
+
+        /* If we're in pingpong mode, overide regular timestamp method */
+        if (worker_settings->pingpong) {
+            timestamp = atomic_load(&pingpong_timestamp);
+        } else {
+            retval = read_packet(rte_mbufs[i], &timestamp);
+        }
+
         if (retval) {
             err_counter++;
             continue;
@@ -656,7 +728,7 @@ static int
 lcore_tx_worker(void *arg)
 {
     struct worker_settings worker_settings;
-    struct rte_mbuf *rte_mbufs[BATCH_SIZE];
+    struct rte_mbuf *rte_mbufs[MAX_BATCH_SIZE];
     struct rate_limiter rate_limiter;
     uint64_t pkt_counter;
     int socket, core;
@@ -676,19 +748,20 @@ lcore_tx_worker(void *arg)
 
     rate_limiter_init(&rate_limiter,
                       worker_settings.rate_limit,
-                      BATCH_SIZE,
+                      worker_settings.batch_size,
                       worker_settings.tx_queue_num);
 
-    tx_allocate_mbufs(socket, rte_mbufs, BATCH_SIZE);
+    tx_allocate_mbufs(socket, rte_mbufs, worker_settings.batch_size);
+
 
     while(running.val) {
         tx_generate_batch(rte_mbufs,
                           &worker_settings,
                           &gen_state,
                           &pkt_counter,
-                          BATCH_SIZE);
+                          worker_settings.batch_size);
 
-        tx_send_batch(rte_mbufs, &worker_settings, BATCH_SIZE);
+        tx_send_batch(rte_mbufs, &worker_settings);
 
         tx_show_counter(socket,
                         core,
@@ -705,7 +778,7 @@ lcore_tx_worker(void *arg)
 static int
 lcore_rx_worker(void *arg)
 {
-    struct rte_mbuf *rte_mbufs[BATCH_SIZE];
+    struct rte_mbuf *rte_mbufs[MAX_BATCH_SIZE];
     struct worker_settings worker_settings;
     struct vector *vector;
     int packets;
@@ -722,8 +795,7 @@ lcore_rx_worker(void *arg)
     while(running.val) {
         /* Get a batch of packets */
         packets = rx_receive_batch(&worker_settings,
-                                   rte_mbufs,
-                                   BATCH_SIZE);
+                                   rte_mbufs);
 
         /* Parse packets, update latency vector */
         rx_parse_packets(&worker_settings,
@@ -749,3 +821,4 @@ lcore_rx_worker(void *arg)
 
     return 0;
 }
+
