@@ -20,7 +20,8 @@
 #include "generator.h"
 #include "rate-limiter.h"
 
-#define FTUPLE_DEF_VAL "6, 192.168.0.1, 10.0.0.1, 100, 200"
+#define FTUPLE_DEF_1 "6, 192.168.0.1, 10.0.0.1, 100, 200"
+#define FTUPLE_DEF_2 "6, 192.168.0.255, 10.0.0.255, 300, 400"
 
 static int lcore_tx_worker(void *arg);
 static int lcore_rx_worker(void *arg);
@@ -34,6 +35,7 @@ struct worker_settings {
     void *args;                        /* Generator custom arguments */
     int time_limit;                    /* Zero stands for no limit */
     int rate_limit;                    /* Zero stands for no limit */
+    int rate_stats;                    /* Report counters each X ns */
     bool pingpong;                     /* See arguments help for pingpong */
     bool collect_latency_stats;
     uint16_t tx_leader_core_id;
@@ -42,57 +44,92 @@ struct worker_settings {
     uint16_t tx_queue_num;
     uint16_t rx_queue_num;
     uint16_t batch_size;
+    char unit_stats[16];               /* Unit for printing to screen */
 };
 
 /* Application arguments and help.
  * Format: name, required, is-boolean, default, help */
 static struct arguments app_args[] = {
 /* Name            R  B  Def     Help */
-{"tx",             1, 0, "0",    "TX port number."},
-{"rx" ,            1, 0, "0",    "RX port number."},
-{"eal",            0, 0, "",     "DPDK EAL arguments."},
-{"txq",            0, 0, "4",    "Number of TX queues."},
-{"rxq",            0, 0, "4",    "Number of RX queues."},
-{"tx-descs",       0, 0, "256",  "Number of TX descs."},
-{"rx-descs",       0, 0, "256",  "Number of RX descs."},
-{"batch-size",     0, 0, "64",   "Batch size for sending packets."},
+{"tx",             1, 0, "0",    "(Config) TX port number."},
+{"rx" ,            1, 0, "0",    "(Config) RX port number."},
+{"eal",            0, 0, "",     "(Config) DPDK EAL arguments."},
+{"txq",            0, 0, "4",    "(Config) Number of TX queues."},
+{"rxq",            0, 0, "4",    "(Config) Number of RX queues."},
+{"tx-descs",       0, 0, "256",  "(Config) Number of TX descs."},
+{"rx-descs",       0, 0, "256",  "(Config) Number of RX descs."},
+{"batch-size",     0, 0, "64",   "(Config) Batch size for sending packets."},
 
 /* Special modes */
-{"ping-pong",      0, 1, NULL,  "Enable ping-pong mode. The TX and RX tasks "
-                                "are performed serially on the same core. "
-                                "Packets are sent one-by-one only after the "
-                                "previous sent packet is received. "
-                                "Latency is measured directly, not using "
-                                "timstamps on the packets' payloads. This more "
-                                "uses only 1 RX/TX queue, regardless of 'rxq' "
-                                "and 'txq' parameters."},
+{"ping-pong",      0, 1, NULL,   "(Mode) Enable ping-pong mode. The TX and RX "
+                                 "tasks are performed serially on the same "
+                                 "core. Packets are sent one-by-one only after "
+                                 "the previous sent packet is received. "
+                                 "Latency is measured directly, not using "
+                                 "timstamps on the packets' payloads. This "
+                                 "mode uses only 1 RX/TX queue, regardless of "
+                                 "'rxq' and 'txq' parameters."},
 
-/* Output files */
-{"lat-file",       0, 0, NULL,   "Out filename for latency per packet values."},
+/* Print statistics to files, */
+{"latency-stats",  0, 0, NULL,   "(Statistics) Collect latency statistics "
+                                 "per X packets "
+                                 "(configured in 'congih.h'). Save results to "
+                                 "file named VALUE."},
+{"user-stats",     0, 0, NULL,   "(Statistics) Collect number of sent/received "
+                                 "packets per user (src-ip). Save results "
+                                 "to file named VALUE."},
+{"rate-stats",     0, 0, "1000", "(Statistics) Print TX and RX statistics to "
+                                 "stdout each VALUE msec. If VALUE==1000, "
+                                 "the statistics are given as Mpps; otherwise, "
+                                 "as packets per VALUE msec."},
 
 /* Limiters */
-{"time-limit",     0, 0, "0",    "Stop application after VALUE seconds"},
-{"rate-limit",     0, 0, "0",    "If VALUE>0, limites TX rate in Kpps."},
+{"time-limit",     0, 0, "0",    "(Limiter) If VALUE>0, stops application "
+                                 "after VALUE seconds."},
+{"rate-limit",     0, 0, "0",    "(Limiter) If VALUE>0, limites TX rate to "
+                                 "be approximately VALUE Kpps."},
 
 /* Statistics */
-{"xstats",         0, 1, NULL,   "Show port xstats at the end."},
-{"hide-zeros",     0, 1, NULL,   "(xstats) Hide zero values."},
+{"xstats",         0, 1, NULL,   "(NIC-stats) Show port xstats at the end."},
+{"hide-zeros",     0, 1, NULL,   "(NIC-stats) Hide zero values with xstats."},
 
-/* Superspreader / nflows policies */
+/* Generator policies */
 {"p-superspreader",0, 1, NULL,   "(Policy) Generate packets using a "
-                                 "superspreader policy, continuously "
-                                 "increaseing dst-ip and dst-port."},
+                                 "superspreader policy. 'n1' knob controls "
+                                 "the number of users (src-ips), 'n2' knob "
+                                 "controls the number of unique destinations "
+                                 "(dst-ips). '5tuple' knob controls the basic "
+                                 "5-tuple for generating packets. Statistics  "
+                                 "per user can be "
+                                 "received using 'user-stats' knob."},
 {"p-nflows",       0, 1, NULL,   "(Policy) Generate packets s.t each packet "
-                                 "is sent with a different src-ip and dst-ip."},
-{"flows",          0, 0, "100",  "(Superspreader / nflows policies) "
-                                 "Number of unique to generate."},
-{"5tuple",         0, 0, FTUPLE_DEF_VAL,
-                                 "(Superspreader / nflows policies) "
-                                 "Base 5-tuple for flow generation."},
+                                 "is sent with a different src-ip and dst-ip. "
+                                 "'n1' knob controls the number of unique "
+                                 "flows to generate. 'n2' knob controls the "
+                                 "probability to change flow (between "
+                                 "(0.0-1.0). '5tuple' knob controls "
+                                 "the basic 5-tuple for generating packets."},
+{"p-paths",        0, 1, NULL,   "(Policy) Given two 5-tuples, flip a coin "
+                                 "with a given probability to decide which "
+                                 "5-tuple to generate per packet. "
+                                 "The probability (0.0-1.0) is changed "
+                                 "every few msec (adjustable, integer) "
+                                 "to be one of two adjustable values. "
+                                 "'n1' knob sets the first probability. "
+                                 "'n2' knob sets the second probability. "
+                                 "'n3' knob controls the change freqency. "
+                                 "'5tuple' knob sets the first 5-tuple. "
+                                 "'5tuple2' knob sets the second 5-tuple. "},
+{"p-pcap",         0, 1, NULL,   "(Policy) Read packets from a PCAP file. "
+                                 "'file' knob controls the PCAP filename. "},
 
-/* PCAP policy */
-{"p-pcap",         0, 1, NULL,   "(Policy) Read packets from a PCAP file."},
-{"pcap-name",      0, 0, "",     "(Pcap policy) name of PCAP file to play."},
+/* Policy knobs */
+{"n1",             0, 0, "100",        "(Policy knob) 'n1' knob."},
+{"n2",             0, 0, "500",        "(Policy knob) 'n2' knob."},
+{"n3",             0, 0, "1",          "(Policy knob) 'n3' knob."},
+{"5tuple",         0, 0, FTUPLE_DEF_1, "(Policy knob) '5tuple' knob."},
+{"5tuple2",        0, 0, FTUPLE_DEF_2, "(Policy knob) '5tuple2' knob."},
+{"file",           0, 0, "",           "(Policy knob) 'file' knob."},
 
 /* Sentinel */
 {NULL,             0, 0, NULL,   "Send and receive packets using DPDK. "
@@ -128,20 +165,31 @@ signal_handler(int signum)
     }
 }
 
-/* Get "ssnf_args" from user */
-static struct ssnf_args
-parse_ssnf_args()
+/* Get "policy_knobs" from user */
+static struct policy_knobs
+parse_policy_knobs()
 {
-    struct ssnf_args ssnf_args;
-    const char *ftuple_args;
+    struct policy_knobs policy_knobs;
+    const char *str;
 
-    ssnf_args.flow_num = ARG_INTEGER(app_args, "flows", 100);
-    ftuple_args = ARG_STRING(app_args, "5tuple", FTUPLE_DEF_VAL);
-    if (ftuple_parse(&ssnf_args.base, ftuple_args)) {
-        printf("Error parsing 5-tuple string \"%s\". Using default.\n",
-               ftuple_args);
+    policy_knobs.n1 = ARG_DOUBLE(app_args, "n1", 100);
+    policy_knobs.n2 = ARG_DOUBLE(app_args, "n2", 500);
+    policy_knobs.n3 = ARG_DOUBLE(app_args, "n3", 1);
+
+    str = ARG_STRING(app_args, "5tuple", FTUPLE_DEF_1);
+    if (ftuple_parse(&policy_knobs.ftuple1, str)) {
+        printf("Error parsing 5-tuple string \"%s\".", str);
+        exit(EXIT_FAILURE);
     }
-    return ssnf_args;
+
+    str = ARG_STRING(app_args, "5tuple2", FTUPLE_DEF_2);
+    if (ftuple_parse(&policy_knobs.ftuple2, str)) {
+        printf("Error parsing 5-tuple string \"%s\".", str);
+        exit(EXIT_FAILURE);
+    }
+
+    policy_knobs.file = ARG_STRING(app_args, "file", "");
+    return policy_knobs;
 }
 
 /* Parse application arguments */
@@ -163,7 +211,8 @@ initialize_settings()
     rx_settings.tx_descs = 64;
     worker_settings.tx_queue_num = tx_settings.tx_queues;
     worker_settings.rx_queue_num = rx_settings.rx_queues;
-    worker_settings.collect_latency_stats = ARG_BOOL(app_args, "lat-file", 0);
+    worker_settings.collect_latency_stats =
+                                 ARG_BOOL(app_args, "latency-stats", 0);
     worker_settings.time_limit = ARG_INTEGER(app_args, "time-limit", 0);
     worker_settings.rate_limit = ARG_INTEGER(app_args, "rate-limit", 0);
     worker_settings.batch_size = ARG_INTEGER(app_args, "batch-size", 64);
@@ -187,6 +236,18 @@ initialize_settings()
         worker_settings.batch_size = 1;
     }
 
+    /* Set the rate of the stats in nanosec, set unit string */
+    worker_settings.rate_stats = ARG_INTEGER(app_args, "rate-stats", 1000);
+    printf("Printing stats to stdout every %d msec\n",
+           worker_settings.rate_stats);
+    if (worker_settings.rate_stats == 1000) {
+        strcpy(worker_settings.unit_stats, "Mpps");
+    } else {
+        sprintf(worker_settings.unit_stats, "Mp / %d ms",
+                worker_settings.rate_stats);
+    }
+    worker_settings.rate_stats *= 1e6;
+
     /* Set generator policy */
     policy_t policy = POLICY_UNDEFINED;
     if (ARG_BOOL(app_args, "p-superspreader", 0)) {
@@ -199,40 +260,53 @@ initialize_settings()
         printf("Packet generation policy was not given. Using default. \n");
     }
 
+    /* Set the policy knobs */
+    struct policy_knobs policy_knobs = parse_policy_knobs();
+    worker_settings.args = alloc_void_arg_bytes(&policy_knobs,
+                                                sizeof(policy_knobs));
+
     switch (policy) {
-    case POLICY_NFLOWS: {
-        struct ssnf_args ssnf_args = parse_ssnf_args();
-        printf("Using n-flows policy with %u flows "
-               "and 5-tuple ", ssnf_args.flow_num);
-        ftuple_print(stdout, &ssnf_args.base);
+    case POLICY_NFLOWS: 
+        printf("Using n-flows policy with %lf flows, %lf pobability, "
+               "and 5-tuple ",
+               policy_knobs.n1,
+               policy_knobs.n2);
+        ftuple_print(stdout, &policy_knobs.ftuple1);
         printf("\n");
         worker_settings.generator = generator_policy_nflows;
         worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
-        worker_settings.args = alloc_void_arg_bytes(&ssnf_args,
-                                                    sizeof(ssnf_args));
         break;
-    }
-    case POLICY_PCAP: {
-        const char *pcap_fname = ARG_STRING(app_args, "pcap-name", "");
-        printf("Using PCAP policy. reading PCAP from \"%s\"\n", pcap_fname);
+    case POLICY_PATHS: 
+        printf("Using paths policy with probabilities %lf,%lf and %lf msec "
+               "frequency, with the 5-tuples ",
+               policy_knobs.n1,
+               policy_knobs.n2,
+               policy_knobs.n3);
+        ftuple_print(stdout, &policy_knobs.ftuple1);
+        printf(", and ");
+        ftuple_print(stdout, &policy_knobs.ftuple2);
+        printf("\n");
+        worker_settings.generator = generator_policy_paths;
+        worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
+        break;
+    case POLICY_PCAP: 
+        printf("Using PCAP policy. reading PCAP from \"%s\"\n",
+               policy_knobs.file);
         worker_settings.generator = generator_policy_pcap;
         worker_settings.generator_mode = GENERATOR_OUT_RAW;
-        worker_settings.args = (void*)pcap_fname;
         break;
-    }
     case POLICY_SUPERSPREADER:
-    default: {
-        struct ssnf_args ssnf_args = parse_ssnf_args();
-        printf("Using superspreader policy with %u flows "
-               "and 5-tuple ", ssnf_args.flow_num);
-        ftuple_print(stdout, &ssnf_args.base);
+    default:
+        printf("Using superspreader policy with %lf users, %lf destinations, "
+               "and 5-tuple ",
+               policy_knobs.n1,
+               policy_knobs.n2);
+        ftuple_print(stdout, &policy_knobs.ftuple1);
         printf("\n");
         worker_settings.generator = generator_policy_superspreader;
         worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
-        worker_settings.args = alloc_void_arg_bytes(&ssnf_args,
-                                                    sizeof(ssnf_args));
         break;
-    }}
+    }
 }
 
 /* Initialzie DPDK from EAL arguments */
@@ -281,7 +355,7 @@ save_latency_file()
     const char *filename;
     FILE *file;
 
-    filename = ARG_STRING(app_args, "lat-file", NULL);
+    filename = ARG_STRING(app_args, "latency-stats", NULL);
     if (!filename) {
         return;
     }
@@ -529,14 +603,17 @@ tx_show_counter(const int socket,
     }
 
     diff_ns = get_time_ns() - last_timestamp;
-    if (diff_ns < 1e9) {
+    if (diff_ns < worker_settings->rate_stats) {
         return;
     }
 
-    counter = atomic_exchange(&tx_counter.val, 0);
-    mpps = (double)counter/1e6/(diff_ns/1e9);
+    /* Normalize to the time interval */
+    diff_ns /= worker_settings->rate_stats;
 
-    printf("TX %.4lf Mpps\n", mpps);
+    counter = atomic_exchange(&tx_counter.val, 0);
+    mpps = (double)counter/1e6/diff_ns;
+
+    printf("TX %.4lf %s\n", mpps, worker_settings->unit_stats);
 
     last_timestamp = get_time_ns();
     (*sec_counter)++;
@@ -702,12 +779,15 @@ rx_show_counter(const int core,
     }
 
     diff_ns = get_time_ns() - last_timestamp;
-    if (diff_ns < 1e9) {
+    if (diff_ns < worker_settings->rate_stats) {
         return;
     }
 
+    /* Normalize to the time interval */
+    diff_ns /= worker_settings->rate_stats;
+
     counter = atomic_exchange(&rx_counter.val, 0);
-    mpps = (double)counter/1e6/(diff_ns/1e9);
+    mpps = (double)counter/1e6/diff_ns;
     err_counter = atomic_exchange(&rx_err_counter.val, 0);
 
     /* Calc avg latency */
@@ -718,8 +798,11 @@ rx_show_counter(const int core,
             (double)diff_total / diff_counter / 1e3;
     rte_spinlock_unlock(&latency_lock);
 
-    printf("RX %.4lf Mpps, errors: %lu, avg. latency %.1lf usec\n",
-           mpps, err_counter, avg_latency_usec);
+    printf("RX %.4lf %s, errors: %lu, avg. latency %.1lf usec\n",
+           mpps,
+           worker_settings->unit_stats,
+           err_counter,
+           avg_latency_usec);
     last_timestamp = get_time_ns();
 }
 
