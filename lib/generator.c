@@ -41,7 +41,7 @@ generator_policy_superspreader(uint64_t pkt_num,
                            sizeof(struct policy_knobs),
                            false);
         state->src_ip = rte_be_to_cpu_32(state->knobs.ftuple1.src_ip);
-        state->dst_ip = rte_be_to_cpu_16(state->knobs.ftuple1.dst_ip);
+        state->dst_ip = rte_be_to_cpu_32(state->knobs.ftuple1.dst_ip);
         state->src_counter = 0;
         state->dst_counter = 0;
     }

@@ -26,7 +26,7 @@ static void compute_icmp_checksum(struct rte_ipv4_hdr *ipv4_hdr);
 /* Fills "mbuf" with a single IPV4 packet of "size" bytes with
  * "ftuple" 5-tuple header info */
 void
-generate_packet_ftuple(struct rte_mbuf *mbuf,
+packet_generate_ftuple(struct rte_mbuf *mbuf,
                        struct rte_ether_addr *src_mac,
                        struct rte_ether_addr *dst_mac,
                        int size,
@@ -167,7 +167,7 @@ generate_packet_ftuple(struct rte_mbuf *mbuf,
 
 /* Fills "mbuf" with raw packet bytes from "bytes" with size "size" */
 void
-generate_packet_raw(struct rte_mbuf *mbuf, const char *bytes, size_t size)
+packet_generate_raw(struct rte_mbuf *mbuf, const char *bytes, size_t size)
 {
     char *dst;
 
@@ -183,14 +183,16 @@ generate_packet_raw(struct rte_mbuf *mbuf, const char *bytes, size_t size)
     mbuf->pkt_len = size;
 }
 
-/* Reads a single packet from "mbuf", returns its timestamp into "timestamp".
- * Returns 0 on valid packet. */
+/* Extracts the 5-tuple "ftuple" from the packet in "mbuf". "bytes" holds
+ * a pointer to the packet payload, and "size" the payload size. */
 int
-read_packet(struct rte_mbuf *mbuf, uint64_t *timestamp)
+packet_read_ftuple(struct rte_mbuf *mbuf,
+                   struct ftuple *ftuple,
+                   char **bytes,
+                   int *size)
 {
     struct rte_ipv4_hdr *ipv4_hdr;
     int header_size;
-    char *payload;
 
     header_size = sizeof(struct rte_ether_hdr);
     ipv4_hdr = rte_pktmbuf_mtod_offset(mbuf,
@@ -198,37 +200,72 @@ read_packet(struct rte_mbuf *mbuf, uint64_t *timestamp)
                                        header_size);
     header_size += sizeof(struct rte_ipv4_hdr);
 
+    /* Extract IP Proto, IP addresses */
+    ftuple->ip_proto = ipv4_hdr->next_proto_id;
+    ftuple->src_ip = ipv4_hdr->src_addr;
+    ftuple->dst_ip = ipv4_hdr->dst_addr;
+
     /* Read L4 header */
     if (ipv4_hdr->next_proto_id == IPPROTO_TCP) {
+        struct rte_tcp_hdr *tcp_hdr;
+        tcp_hdr = rte_pktmbuf_mtod_offset(mbuf,
+                                          struct rte_tcp_hdr *,
+                                          sizeof(struct rte_ether_hdr) +
+                                          sizeof(*ipv4_hdr));
+        ftuple->src_port = tcp_hdr->src_port;
+        ftuple->dst_port = tcp_hdr->dst_port;
         header_size += sizeof(struct rte_tcp_hdr);
+
     } else if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
+        struct rte_udp_hdr *udp_hdr;
+        udp_hdr = rte_pktmbuf_mtod_offset(mbuf,
+                                          struct rte_udp_hdr *,
+                                          sizeof(struct rte_ether_hdr) +
+                                          sizeof(*ipv4_hdr));
+        ftuple->src_port = udp_hdr->src_port;
+        ftuple->dst_port = udp_hdr->dst_port;
         header_size += sizeof(struct rte_udp_hdr);
     } else if (ipv4_hdr->next_proto_id == IPPROTO_ICMP) {
         header_size += sizeof(struct rte_icmp_hdr);
+        /* Unknown ports */
+        ftuple->src_port = 0;
+        ftuple->dst_port = 0;
     } else {
         /* Cannot read - unknown IP protocol */
         return READ_ERROR_UNSUPPORTED_PROTOCOL;
     }
 
-    payload = rte_pktmbuf_mtod_offset(mbuf, char*, header_size);
+    if (bytes && size) {
+        *bytes = rte_pktmbuf_mtod_offset(mbuf, char*, header_size);
+        *size = rte_be_to_cpu_16(ipv4_hdr->total_length) - header_size +
+                sizeof(struct rte_ether_hdr);
+    }
+
+    return 0;
+}
+
+/* Extract a timestamp from a packet payload */
+uint64_t
+packet_parse_timestamp(char *bytes, int size)
+{
+    /* Invalid args */
+    if (!bytes || size != 10) {
+        return 0;
+    }
 
     /* Read timestamp and hash */
-    uint64_t ts = *(uint64_t*)payload;
-    payload += sizeof(uint64_t);
-    uint16_t hash = *(uint16_t*)payload;
+    uint64_t ts = *(uint64_t*)bytes;
+    bytes += sizeof(uint64_t);
+    uint16_t hash = *(uint16_t*)bytes;
     uint16_t check = hash_uint64(ts) & 0xFFFF;
 
     /* Check hash correcentss */
     if (hash != check) {
         /* Invalid packet! */
-        return READ_ERROR_HASH;
+        return 0;
     }
 
-    if (timestamp) {
-        *timestamp = ts;
-    }
-
-    return 0;
+    return ts;
 }
 
 int

@@ -30,7 +30,7 @@ struct list {
     struct list *next;     /* Next list element. */
 };
 
-#define LNM_LIST_INITIALIZER(LIST) { LIST, LIST }
+#define LIST_INITIALIZER(LIST) { LIST, LIST }
 
 /* Static initilizer */
 static inline void list_init(struct list *);

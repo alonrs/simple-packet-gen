@@ -15,6 +15,7 @@
 #include "common.h"
 #include "arguments.h"
 #include "vector.h"
+#include "map.h"
 #include "packet.h"
 #include "device.h"
 #include "generator.h"
@@ -37,7 +38,8 @@ struct worker_settings {
     int rate_limit;                    /* Zero stands for no limit */
     int rate_stats;                    /* Report counters each X ns */
     bool pingpong;                     /* See arguments help for pingpong */
-    bool collect_latency_stats;
+    bool collect_latency_stats;        /* Store latency results in vector */
+    bool collect_ftuple_stats;         /* Store 5-tuple results in map */
     uint16_t tx_leader_core_id;
     uint16_t rx_leader_core_id;
     uint16_t queue_index;
@@ -45,6 +47,13 @@ struct worker_settings {
     uint16_t rx_queue_num;
     uint16_t batch_size;
     char unit_stats[16];               /* Unit for printing to screen */
+};
+
+/* Elements in 5-tuple stats */
+struct ftuple_stat_node {
+    struct map_node node;
+    struct ftuple ftuple;
+    uint64_t counter;
 };
 
 /* Application arguments and help.
@@ -75,8 +84,8 @@ static struct arguments app_args[] = {
                                  "per X packets "
                                  "(configured in 'congih.h'). Save results to "
                                  "file named VALUE."},
-{"user-stats",     0, 0, NULL,   "(Statistics) Collect number of sent/received "
-                                 "packets per user (src-ip). Save results "
+{"5tuple-stats",   0, 0, NULL,   "(Statistics) Collect number of sent/received "
+                                 "packets per 5-tuple. Save results "
                                  "to file named VALUE."},
 {"rate-stats",     0, 0, "1000", "(Statistics) Print TX and RX statistics to "
                                  "stdout each VALUE msec. If VALUE==1000, "
@@ -146,10 +155,14 @@ MESSAGE_T(long, rx_err_counter);
 MESSAGE_T(int, pingpong_send);
 
 rte_spinlock_t latency_lock;
+rte_spinlock_t ftuple_stats_map_lock;
 atomic_long latency_counter;
 atomic_long latency_total;
 atomic_long pingpong_timestamp;
+
+/* Collects statistics */
 static struct vector *latency_vector;
+static struct map ftuple_stats_map;
 
 static struct port_settings tx_settings;
 static struct port_settings rx_settings;
@@ -213,6 +226,8 @@ initialize_settings()
     worker_settings.rx_queue_num = rx_settings.rx_queues;
     worker_settings.collect_latency_stats =
                                  ARG_BOOL(app_args, "latency-stats", 0);
+    worker_settings.collect_ftuple_stats =
+                                 ARG_BOOL(app_args, "5tuple-stats", 0);
     worker_settings.time_limit = ARG_INTEGER(app_args, "time-limit", 0);
     worker_settings.rate_limit = ARG_INTEGER(app_args, "rate-limit", 0);
     worker_settings.batch_size = ARG_INTEGER(app_args, "batch-size", 64);
@@ -266,7 +281,7 @@ initialize_settings()
                                                 sizeof(policy_knobs));
 
     switch (policy) {
-    case POLICY_NFLOWS: 
+    case POLICY_NFLOWS:
         printf("Using n-flows policy with %lf flows, %lf pobability, "
                "and 5-tuple ",
                policy_knobs.n1,
@@ -276,7 +291,7 @@ initialize_settings()
         worker_settings.generator = generator_policy_nflows;
         worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
         break;
-    case POLICY_PATHS: 
+    case POLICY_PATHS:
         printf("Using paths policy with probabilities %lf,%lf and %lf msec "
                "frequency, with the 5-tuples ",
                policy_knobs.n1,
@@ -289,7 +304,7 @@ initialize_settings()
         worker_settings.generator = generator_policy_paths;
         worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
         break;
-    case POLICY_PCAP: 
+    case POLICY_PCAP:
         printf("Using PCAP policy. reading PCAP from \"%s\"\n",
                policy_knobs.file);
         worker_settings.generator = generator_policy_pcap;
@@ -348,9 +363,9 @@ initialize_dpdk()
     free(args_mod);
 }
 
-/* Save latency file */
+/* Save latency statistics file */
 static void
-save_latency_file()
+save_latency_statistics_file()
 {
     const char *filename;
     FILE *file;
@@ -374,6 +389,42 @@ save_latency_file()
     VECTOR_FOR_EACH(latency_vector, val, uint64_t) {
         fprintf(file, "%lu\n", val);
     }
+
+    fclose(file);
+}
+
+/* Save 5-tuple statistics file */
+static void
+save_ftuple_statistics_file()
+{
+    struct ftuple_stat_node *ftuple_stat_node;
+    struct map_state *map_state;
+    const char *filename;
+    FILE *file;
+
+    filename = ARG_STRING(app_args, "5tuple-stats", NULL);
+    if (!filename) {
+        return;
+    }
+
+    file = fopen(filename, "w");
+    if (!file) {
+        printf("Error: cannot open \"%s\" for writing. \n", filename);
+        return;
+    }
+
+    printf("Saving %lu collected 5-tuple items in \"%s\"... \n",
+           map_size(&ftuple_stats_map), filename);
+
+    /* Go over all map elements, print to file */
+    map_state = map_state_acquire(&ftuple_stats_map);
+    MAP_FOR_EACH(ftuple_stat_node, node, map_state) {
+        fprintf(file, "%-11u ", ftuple_stat_node->node.hash);
+        ftuple_print(file, &ftuple_stat_node->ftuple);
+        fprintf(file, " %lu\n", ftuple_stat_node->counter);
+    }
+    map_state_release(map_state);
+    map_destroy(&ftuple_stats_map);
 
     fclose(file);
 }
@@ -468,8 +519,11 @@ main(int argc, char *argv[])
     atomic_init(&latency_total, 0);
     atomic_init(&pingpong_timestamp, 0);
     atomic_init(&pingpong_send.val, 1);
+
     rte_spinlock_init(&latency_lock);
+    rte_spinlock_init(&ftuple_stats_map_lock);
     latency_vector = vector_init(sizeof(struct vector*));
+    map_init(&ftuple_stats_map);
 
     /* Check that there is an even number of ports to send/receive on. */
     if (rte_eth_dev_count_avail() < 2) {
@@ -499,8 +553,9 @@ main(int argc, char *argv[])
         port_xstats_display(rx_settings.port_id, hide_zeros);
     }
 
-    /* Save latency file */
-    save_latency_file();
+    /* Save statistics */
+    save_latency_statistics_file();
+    save_ftuple_statistics_file();
 
     return 0;
 }
@@ -532,7 +587,7 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
 
         /* Fill "rte_mbufs[i]" with data according to the generator mode */
         if (worker_settings->generator_mode == GENERATOR_OUT_FTUPLE) {
-            generate_packet_ftuple(rte_mbufs[i],
+            packet_generate_ftuple(rte_mbufs[i],
                                    &tx_settings.mac_addr,
                                    &rx_settings.mac_addr,
                                    PACKET_SIZE,
@@ -540,7 +595,7 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
                                    (worker_settings->queue_index==0) &&
                                    DEBUG_PRINT_PACKETS);
         } else if (worker_settings->generator_mode == GENERATOR_OUT_RAW) {
-            generate_packet_raw(rte_mbufs[i],
+            packet_generate_raw(rte_mbufs[i],
                                 ((struct raw_packet*)gen_data)->bytes,
                                 ((struct raw_packet*)gen_data)->size);
         }
@@ -673,6 +728,35 @@ rx_receive_batch(const struct worker_settings *worker_settings,
     return packets;
 }
 
+static void
+ftuple_stats_collect(struct map *ftuple_stats, struct ftuple *ftuple, int val)
+{
+    struct ftuple_stat_node *ftuple_stat_node;
+    struct map_state *map_state;
+    uint32_t hash;
+
+    hash = ftuple_hash(ftuple);
+
+    map_state = map_state_acquire(ftuple_stats);
+
+    /* If node with 5-tuple exists, update counter */
+    MAP_FOR_EACH_WITH_HASH(ftuple_stat_node, node, hash, map_state) {
+        if (ftuple_compare(&ftuple_stat_node->ftuple, ftuple)) {
+            ftuple_stat_node->counter+=val;
+            map_state_release(map_state);
+            return;
+        }
+    }
+
+    map_state_release(map_state);
+
+    /* Stat was not found, insert new element to map */
+    ftuple_stat_node = xmalloc(sizeof(*ftuple_stat_node));
+    ftuple_stat_node->ftuple = *ftuple;
+    ftuple_stat_node->counter = val;
+    map_insert(ftuple_stats, &ftuple_stat_node->node, hash);
+}
+
 /* Reads "num_packets" from "rte_mbufs" according to the settings defined in
  * "worker_settings", and update global RX counters. In case the latencies
  * need to be collected, they will be pushed into "vector" every "gap" packets.
@@ -685,8 +769,10 @@ rx_parse_packets(const struct worker_settings *worker_settings,
                  struct rte_mbuf **rte_mbufs,
                  const int num_packets,
                  const int gap,
-                 struct vector *vector)
+                 struct vector *latency_stats,
+                 struct map *ftuple_stats)
 {
+    struct ftuple ftuple;
     uint64_t timestamp;
     uint64_t current_ns;
     uint64_t latency_ns;
@@ -694,7 +780,9 @@ rx_parse_packets(const struct worker_settings *worker_settings,
     int retval;
     int err_counter;
     int diff_counter;
-    
+    char *payload;
+    int size;
+
     current_ns = get_time_ns();
     err_counter = 0;
     diff_counter = 0;
@@ -704,30 +792,34 @@ rx_parse_packets(const struct worker_settings *worker_settings,
     /* Read incoming packets, uppdate latency vector and global counters */
     for (int i=0; i<num_packets; i++) {
 
-        /* If we're in pingpong mode, overide regular timestamp method */
-        if (worker_settings->pingpong) {
-            timestamp = atomic_load(&pingpong_timestamp);
-        } else {
-            retval = read_packet(rte_mbufs[i], &timestamp);
-        }
-
+        /* Read the packet 5-tuple */
+        retval = packet_read_ftuple(rte_mbufs[i], &ftuple, &payload, &size);
         if (retval) {
             err_counter++;
             continue;
         }
 
-        /* Update local stats */
-        latency_ns = current_ns - timestamp;
-        diff_total += latency_ns;
-        diff_counter++;
+        /* Try to parse timestamp from the packet */
+        timestamp = packet_parse_timestamp(payload, size);
+        if (worker_settings->pingpong && !timestamp) {
+            timestamp = atomic_load(&pingpong_timestamp);
+        }
 
-        if (!worker_settings->collect_latency_stats) {
-            continue;
+        /* Collect 5-tuple statistics */
+        if (worker_settings->collect_ftuple_stats) {
+            ftuple_stats_collect(ftuple_stats, &ftuple, 1);
+        }
+
+        /* Update latency statistics (for valid timestamps)*/
+        if (timestamp) {
+            latency_ns = current_ns - timestamp;
+            diff_total += latency_ns;
+            diff_counter++;
         }
 
         /* Update local vector every LATENCY_COLLECTOR_GAP packets */
-        if (i%gap==0) {
-            vector_push(vector, &latency_ns);
+        if ((worker_settings->collect_latency_stats) && (i%gap==0)) {
+            vector_push(latency_stats, &latency_ns);
         }
     }
 
@@ -864,6 +956,7 @@ lcore_rx_worker(void *arg)
     struct rte_mbuf *rte_mbufs[MAX_BATCH_SIZE];
     struct worker_settings worker_settings;
     struct vector *vector;
+    struct map map;
     int packets;
     int core;
 
@@ -872,8 +965,10 @@ lcore_rx_worker(void *arg)
                        sizeof(worker_settings),
                        true);
     core = rte_lcore_id();
-    /* Local vector for latency values */
+
+    /* Initiate containers for collecting statistics */
     vector = vector_init(sizeof(uint64_t));
+    map_init(&map);
 
     while(running.val) {
         /* Get a batch of packets */
@@ -885,7 +980,8 @@ lcore_rx_worker(void *arg)
                         rte_mbufs,
                         packets,
                         LATENCY_COLLECTOR_GAP,
-                        vector);
+                        vector,
+                        &map);
 
         /* Free allocated memory */
         rx_free_memory(rte_mbufs, packets);
@@ -896,12 +992,36 @@ lcore_rx_worker(void *arg)
     }
 
     /* Push values from local vector into the global vector */
-    uint64_t val;
-    VECTOR_FOR_EACH(vector, val, uint64_t) {
-        vector_push(latency_vector, &val);
+    if (worker_settings.collect_latency_stats) {
+        printf("RX queue %d updating global latency statistics "
+               "with %ld items... \n",
+                worker_settings.queue_index,
+                vector_size(vector));
+        uint64_t val;
+        VECTOR_FOR_EACH(vector, val, uint64_t) {
+            vector_push(latency_vector, &val);
+        }
+        vector_destroy(vector);
     }
-    vector_destroy(vector);
+
+    /* Push values from local map into the global map */
+    if (worker_settings.collect_ftuple_stats) {
+        printf("RX queue %d updating global 5-tuple statistics "
+               "with %ld items... \n",
+               worker_settings.queue_index,
+               map_size(&map));
+        rte_spinlock_lock(&ftuple_stats_map_lock);
+        struct map_state *map_state = map_state_acquire(&map);
+        struct ftuple_stat_node *ftuple_stat_node;
+        MAP_FOR_EACH(ftuple_stat_node, node, map_state) {
+            ftuple_stats_collect(&ftuple_stats_map,
+                                 &ftuple_stat_node->ftuple,
+                                 ftuple_stat_node->counter);
+        }
+        map_state_release(map_state);
+        rte_spinlock_unlock(&ftuple_stats_map_lock);
+        map_destroy(&map);
+    }
 
     return 0;
 }
-

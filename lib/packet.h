@@ -6,18 +6,18 @@
 #include <rte_mbuf.h>
 #include <rte_ether.h>
 #include <rte_byteorder.h>
+#include "hash.h"
 
 /* Error types */
 #define READ_ERROR_UNSUPPORTED_PROTOCOL 1
-#define READ_ERROR_HASH 2
 
 /* Five tuple struct */
 struct ftuple {
-    uint8_t ip_proto;
     rte_be32_t src_ip;
     rte_be32_t dst_ip;
     rte_be16_t src_port;
     rte_be16_t dst_port;
+    uint8_t ip_proto;
 };
 
 /* Returns an IP address from "a"."b"."c"."d" */
@@ -40,7 +40,7 @@ get_port(uint16_t port)
 
 /* Fills "mbuf" with a single IPV4 packet of "size" bytes with
  * "ftuple" 5-tuple header info */
-void generate_packet_ftuple(struct rte_mbuf *mbuf,
+void packet_generate_ftuple(struct rte_mbuf *mbuf,
                             struct rte_ether_addr *src_mac,
                             struct rte_ether_addr *dst_mac,
                             int size,
@@ -48,12 +48,17 @@ void generate_packet_ftuple(struct rte_mbuf *mbuf,
                             bool print_packet);
 
 /* Fills "mbuf" with raw packet bytes from "bytes" with size "size" */
-void generate_packet_raw(struct rte_mbuf *mbuf, const char *bytes, size_t size);
+void packet_generate_raw(struct rte_mbuf *mbuf, const char *bytes, size_t size);
 
+/* Extracts the 5-tuple "ftuple" from the packet in "mbuf". "bytes" holds
+ * a pointer to the packet payload, and "size" the payload size. */
+int packet_read_ftuple(struct rte_mbuf *mbuf,
+                       struct ftuple *ftuple,
+                       char **bytes,
+                       int *size);
 
-/* Reads a single packet from "mbuf", returns its timestamp into "timestamp".
- * Returns 0 on valid packet. */
-int read_packet(struct rte_mbuf *mbuf, uint64_t *timestamp);
+/* Extract a timestamp from a packet payload */
+uint64_t packet_parse_timestamp(char *bytes, int size);
 
 /* Parses "str" into the 5-tuple "ftuple". Returns 0 on success.
  * "str" format: IP_PROTO,SRC-IP,DST-IP,SRC-PORT,DST-PORT
@@ -63,5 +68,22 @@ int ftuple_parse(struct ftuple *ftuple, const char *str);
 
 /* Print 5-tuple to file */
 void ftuple_print(FILE *f, struct ftuple *ftuple);
+
+static inline uint32_t
+ftuple_hash(struct ftuple *ftuple)
+{
+    return hash_bytes(ftuple, sizeof(*ftuple), 0);
+}
+
+/* Returns true iff "a" == "b" */
+static inline bool
+ftuple_compare(struct ftuple *a, struct ftuple *b)
+{
+    return a->src_ip == b->src_ip &&
+           a->dst_ip == b->dst_ip &&
+           a->src_port == b->src_port &&
+           a->dst_port == b->dst_port &&
+           a->ip_proto == b->ip_proto;
+}
 
 #endif

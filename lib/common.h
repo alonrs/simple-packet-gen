@@ -97,6 +97,14 @@
 #define MESSAGE_T(TYPE, NAME) volatile static union CACHE_ALIGNED \
     { char _x[64]; TYPE val; } NAME
 
+/* Expands to a string that looks like "<file>:<line>", e.g. "tmp.c:10".
+ *
+ * See http://c-faq.com/ansi/stringize.html for an explanation of STRINGIZE
+ * and STRINGIZE2. */
+#define SOURCE_LOCATOR __FILE__ ":" STRINGIZE(__LINE__)
+#define STRINGIZE(ARG) STRINGIZE2(ARG)
+#define STRINGIZE2(ARG) #ARG
+
 /* Like the standard assert macro, except always evaluates the condition,
  * even with NDEBUG. */
 #ifndef NDEBUG
@@ -105,7 +113,6 @@
 #else
 #define ASSERT(CONDITION) ((void) (CONDITION))
 #endif
-
 
 /* Allocate or fail */
 static inline void*
@@ -118,6 +125,12 @@ xmalloc(size_t size)
         exit(EXIT_FAILURE);
     }
     return ptr;
+}
+
+static inline void
+abort_msg(const char *msg) {
+    fprintf(stderr, "%s\n", msg);
+    abort();
 }
 
 /* Return the time in nanosecs */

@@ -37,10 +37,10 @@ void vector_iterator_next(struct vector_iterator *it);
 void* vector_iterator_get(struct vector_iterator *it);
 
 /* Go over all elements of type TYPE in VECTOR, populate in VAR */
-#define VECTOR_FOR_EACH(VECTOR, VAR, TYPE)                                \
-    for(struct vector_iterator it = vector_begin(VECTOR);                 \
-        vector_iterator_valid(&it), VAR=*(TYPE*)vector_iterator_get(&it); \
-        vector_iterator_next(&it))
+#define VECTOR_FOR_EACH(VECTOR, VAR, TYPE)                                 \
+    for(struct vector_iterator it = vector_begin(VECTOR);                  \
+        vector_iterator_valid(&it) ? (VAR=*(TYPE*)vector_iterator_get(&it),\
+        true) : false; vector_iterator_next(&it))
 
 
 #endif
