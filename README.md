@@ -1,6 +1,6 @@
 # General Info
 
-Simple packet-gen is a native app for sending raw ethernet packets on a PCI network device using DPDK. It comes with three included packet generator modes, and can be easily extended to support more.
+Simple packet-gen is a native app for sending raw ethernet packets on a PCI network device using DPDK. It comes with four included packet generator modes, and can be easily extended to support more.
 
 ![screenshot](screenshot.gif)
 
@@ -30,6 +30,11 @@ make debug
 ```
 
 # Running
+Bind NIC ports to DPDK driver:
+```bash
+./bind.sh
+```
+
 Use `run.sh` to start the application. Usage examples:
 ```bash
 # Show command line arguments and help
@@ -39,12 +44,12 @@ Use `run.sh` to start the application. Usage examples:
 # send on PCI 0000:01:00.0, receive on PCI 0000:02:00.0
 ./run.sh --tx 0 --rx 1 --eal "-w 0000:01:00.0 -w 0000:02:00.0" --txq 8 --rxq 4
 
-# Same as before, use "superspreader" mode with 700 flows, start from 5-tuple
+# Same as before, use "superspreader" mode with 700 users, start from 5-tuple
 # [TCP, src-ip: 10.0.0.1, dst-ip: 20.0.0.1, src-port: 30, dst-port: 500]
-./run.sh --tx 0 --rx 1 --eal "-w 0000:01:00.0 -w 0000:02:00.0" --txq 8 --rxq 4 --p-superspreader --5tuple "6,10.0.0.1,20.0.0.1,30,500" --flows 700
+./run.sh --tx 0 --rx 1 --eal "-w 0000:01:00.0 -w 0000:02:00.0" --txq 8 --rxq 4 --p-superspreader --5tuple "6,10.0.0.1,20.0.0.1,30,500" --n1 700
 
 # Same as before, read PCAP file from "./trace.pcap"
-./run.sh --tx 0 --rx 1 --eal "-w 0000:01:00.0 -w 0000:02:00.0" --txq 8 --rxq 4 --p-pcap --pcap-file "./trace.pcap"
+./run.sh --tx 0 --rx 1 --eal "-w 0000:01:00.0 -w 0000:02:00.0" --txq 8 --rxq 4 --p-pcap --file "./trace.pcap"
 ```
 
 To start GDB, use `run.sh` with GDB as the first argument.
