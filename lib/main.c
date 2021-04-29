@@ -23,6 +23,7 @@
 
 #define FTUPLE_DEF_1 "6, 192.168.0.1, 10.0.0.1, 100, 200"
 #define FTUPLE_DEF_2 "6, 192.168.0.255, 10.0.0.255, 300, 400"
+#define MAP_INITIAL_SIZE 512
 
 static int lcore_tx_worker(void *arg);
 static int lcore_rx_worker(void *arg);
@@ -398,7 +399,6 @@ static void
 save_ftuple_statistics_file()
 {
     struct ftuple_stat_node *ftuple_stat_node;
-    struct map_state *map_state;
     const char *filename;
     FILE *file;
 
@@ -417,13 +417,12 @@ save_ftuple_statistics_file()
            map_size(&ftuple_stats_map), filename);
 
     /* Go over all map elements, print to file */
-    map_state = map_state_acquire(&ftuple_stats_map);
-    MAP_FOR_EACH(ftuple_stat_node, node, map_state) {
+    MAP_FOR_EACH(ftuple_stat_node, node, &ftuple_stats_map) {
         fprintf(file, "%-11u ", ftuple_stat_node->node.hash);
         ftuple_print(file, &ftuple_stat_node->ftuple);
         fprintf(file, " %lu\n", ftuple_stat_node->counter);
+        free(ftuple_stat_node);
     }
-    map_state_release(map_state);
     map_destroy(&ftuple_stats_map);
 
     fclose(file);
@@ -523,7 +522,7 @@ main(int argc, char *argv[])
     rte_spinlock_init(&latency_lock);
     rte_spinlock_init(&ftuple_stats_map_lock);
     latency_vector = vector_init(sizeof(struct vector*));
-    map_init(&ftuple_stats_map);
+    map_init(&ftuple_stats_map, MAP_INITIAL_SIZE);
 
     /* Check that there is an even number of ports to send/receive on. */
     if (rte_eth_dev_count_avail() < 2) {
@@ -732,23 +731,17 @@ static void
 ftuple_stats_collect(struct map *ftuple_stats, struct ftuple *ftuple, int val)
 {
     struct ftuple_stat_node *ftuple_stat_node;
-    struct map_state *map_state;
     uint32_t hash;
 
     hash = ftuple_hash(ftuple);
 
-    map_state = map_state_acquire(ftuple_stats);
-
     /* If node with 5-tuple exists, update counter */
-    MAP_FOR_EACH_WITH_HASH(ftuple_stat_node, node, hash, map_state) {
+    MAP_FOR_EACH_WITH_HASH(ftuple_stat_node, node, hash, ftuple_stats) {
         if (ftuple_compare(&ftuple_stat_node->ftuple, ftuple)) {
             ftuple_stat_node->counter+=val;
-            map_state_release(map_state);
             return;
         }
     }
-
-    map_state_release(map_state);
 
     /* Stat was not found, insert new element to map */
     ftuple_stat_node = xmalloc(sizeof(*ftuple_stat_node));
@@ -806,7 +799,7 @@ rx_parse_packets(const struct worker_settings *worker_settings,
         }
 
         /* Collect 5-tuple statistics */
-        if (worker_settings->collect_ftuple_stats) {
+        if ((worker_settings->collect_ftuple_stats) && (i%gap==0)) {
             ftuple_stats_collect(ftuple_stats, &ftuple, 1);
         }
 
@@ -968,7 +961,7 @@ lcore_rx_worker(void *arg)
 
     /* Initiate containers for collecting statistics */
     vector = vector_init(sizeof(uint64_t));
-    map_init(&map);
+    map_init(&map, MAP_INITIAL_SIZE);
 
     while(running.val) {
         /* Get a batch of packets */
@@ -1011,14 +1004,13 @@ lcore_rx_worker(void *arg)
                worker_settings.queue_index,
                map_size(&map));
         rte_spinlock_lock(&ftuple_stats_map_lock);
-        struct map_state *map_state = map_state_acquire(&map);
         struct ftuple_stat_node *ftuple_stat_node;
-        MAP_FOR_EACH(ftuple_stat_node, node, map_state) {
+        MAP_FOR_EACH(ftuple_stat_node, node, &map) {
             ftuple_stats_collect(&ftuple_stats_map,
                                  &ftuple_stat_node->ftuple,
                                  ftuple_stat_node->counter);
+            free(ftuple_stat_node);
         }
-        map_state_release(map_state);
         rte_spinlock_unlock(&ftuple_stats_map_lock);
         map_destroy(&map);
     }

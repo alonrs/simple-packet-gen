@@ -6,8 +6,7 @@
 #include <stdbool.h>
 #include "common.h"
 
-/* Concurrent map. Supports several concurrent readers, and a single concurrent
- * writer. To iterate, the user need to acuire a "map state" (snapshop). */
+/* Simple hash-table. Thread unsafe. */
 
 struct map_node {
     struct map_node *next; /* Next node with same hash. */
@@ -22,17 +21,13 @@ struct map_cursor {
     bool accross_entries;  /* Hold cursor accross map entries */
 };
 
-/* Map state (snapshot), must be acquired before map iteration, and released
- * afterwards. Opaque data structure */
-struct map_state;
-
 /* Concurrent hash map. */
 struct map {
-    struct map_state *impl;
+    struct map_impl *impl;
 };
 
-/* Initialization. */
-void map_init(struct map *);
+/* Initialization of "map". "size" shoule be a power of 2 */
+void map_init(struct map *map, size_t size);
 void map_destroy(struct map *);
 
 /* Counters. */
@@ -44,23 +39,6 @@ double map_utilization(const struct map *map);
 size_t map_insert(struct map *, struct map_node *, uint32_t hash);
 size_t map_remove(struct map *, struct map_node *);
 
-/* Acquire/release map concurrent state. Use with iteration macros.
- * Each acquired state must be released. */
-struct map_state* map_state_acquire(struct map *map);
-void map_state_release(struct map_state *state);
-
-/* Iteration macros. Usage example:
- *
- * struct {
- *     struct map_node node;
- *     int value;
- * } *data;
- * struct map_state *map_state = map_state_acquire(&map);
- * MAP_FOR_EACH(data, node, map_state) {
- *      ...
- * }
- * map_state_release(map_state);
- */
 #define MAP_FOR_EACH(NODE, MEMBER, STATE) \
     MAP_FOR_EACH__(NODE, MEMBER, MAP, map_start__(STATE), STATE)
 
@@ -68,9 +46,9 @@ void map_state_release(struct map_state *state);
     MAP_FOR_EACH__(NODE, MEMBER, MAP, map_find__(STATE, HASH), STATE)
 
 /* Ieration, private methods. Use iteration macros instead */
-struct map_cursor map_start__(struct map_state *state);
-struct map_cursor map_find__(struct map_state *state, uint32_t hash);
-void map_next__(struct map_state *state, struct map_cursor *cursor);
+struct map_cursor map_start__(struct map *state);
+struct map_cursor map_find__(struct map *state, uint32_t hash);
+void map_next__(struct map *state, struct map_cursor *cursor);
 
 #define MAP_FOR_EACH__(NODE, MEMBER, MAP, START, STATE)                 \
     for(struct map_cursor cursor_ = START;                              \
