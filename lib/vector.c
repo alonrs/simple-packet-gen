@@ -177,7 +177,8 @@ vector_begin(struct vector *vector)
             .vector = vector,
             .chunk_index = 0,
             .elem_index = 0,
-            .chunk = list_is_empty(&vector->chunks) ? NULL : 
+            .chunk = list_is_empty(&vector->chunks) ?
+                     NULL : 
                      CONTAINER_OF(list_front(&vector->chunks),
                                   struct chunk,
                                   node)
@@ -188,15 +189,17 @@ vector_begin(struct vector *vector)
 bool
 vector_iterator_valid(struct vector_iterator *it)
 {
-    uint32_t num_elements = it->chunk ? 
-                            (it->chunk->size / it->vector->elem_size) : 0;
-    bool in_last_chunk = (it->vector->num_chunks == it->chunk_index);
-    bool in_middle_of_chunk = (it->elem_index < num_elements);
 
-    return it->vector &&
-           it->chunk && 
-           ((it->vector->num_chunks > it->chunk_index) ||
-            (in_last_chunk && in_middle_of_chunk));
+    if (!it->vector || ! it->chunk) {
+        return false;
+    }
+
+    uint32_t num_elements = it->chunk->size / it->vector->elem_size;
+    bool in_last_chunk = it->vector->num_chunks-1 == it->chunk_index;
+    bool in_middle_of_chunk = it->elem_index < num_elements;
+
+    return (it->vector->num_chunks > it->chunk_index) ||
+           (in_last_chunk && in_middle_of_chunk);
 }
 
 void

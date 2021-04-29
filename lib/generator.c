@@ -50,12 +50,12 @@ generator_policy_superspreader(uint64_t pkt_num,
         state = args;
     }
 
-    if (state->src_counter == state->knobs.n1) {
+    if (state->src_counter >= state->knobs.n1) {
         state->src_counter = 0;
         state->dst_counter++;
     }
 
-    if (state->dst_counter == state->knobs.n2) {
+    if (state->dst_counter >= state->knobs.n2) {
         state->dst_counter = 0;
     }
 
@@ -233,9 +233,14 @@ generator_policy_pcap(uint64_t pkt_num,
                pcap_geterr(state->p));
         exit(1);
     }
-
-    /* Return a pointer to raw packet */
-    *out = &state->raw;
+    
+    /* In case no more packets */
+    if (ret != 1) {
+        *out = NULL;
+    } else {
+        /* Return a pointer to raw packet */
+        *out = &state->raw;
+    }
 
     return state;
 }

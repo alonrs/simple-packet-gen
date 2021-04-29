@@ -48,6 +48,7 @@ struct worker_settings {
     uint16_t tx_queue_num;
     uint16_t rx_queue_num;
     uint16_t batch_size;
+    uint16_t stats_gap;
     char unit_stats[16];               /* Unit for printing to screen */
 };
 
@@ -91,13 +92,11 @@ static struct arguments app_args[] = {
 
 /* Print statistics to files, */
 {"latency-stats",  0, 0, NULL,   "(Statistics) Collect latency statistics "
-                                 "per X packets "
-                                 "(configured in 'congih.h'). Save results to "
+                                 "per 'stats-gap' packets. Save results to "
                                  "file named VALUE."},
 {"5tuple-stats",   0, 0, NULL,   "(Statistics) Collect number of received "
-                                 "packets per X 5-tuples "
-                                 "(configured in 'congih.h'). Save results "
-                                 "to file named VALUE."},
+                                 "packets per 'stats-gap' 5-tuples. Save "
+                                 "results to file named VALUE."},
 {"srcip-stats",    0, 0, NULL,   "(Statistics) Collect number of sent/received "
                                  "packets per src-ip. Useful for DDOS attack "
                                  "analysis. Save results to file named VALUE."},
@@ -105,6 +104,8 @@ static struct arguments app_args[] = {
                                  "stdout each VALUE msec. If VALUE==1000, "
                                  "the statistics are given as Mpps; otherwise, "
                                  "as packets per VALUE msec."},
+{"stats-gap",      0, 0, "24",   "(Statistics) Controls the gap (in packets) "
+                                 "between statistics measurements."},
 
 /* Limiters */
 {"time-limit",     0, 0, "0",    "(Limiter) If VALUE>0, stops application "
@@ -173,7 +174,7 @@ rte_spinlock_t ftuple_stats_map_lock;
 rte_spinlock_t srcip_stats_map_lock;
 atomic_long latency_counter;
 atomic_long latency_total;
-atomic_long pingpong_timestamp;
+atomic_ulong pingpong_timestamp;
 
 /* Collects statistics */
 static struct vector *latency_vector;
@@ -250,6 +251,7 @@ initialize_settings()
     worker_settings.rate_limit = ARG_INTEGER(app_args, "rate-limit", 0);
     worker_settings.batch_size = ARG_INTEGER(app_args, "batch-size", 64);
     worker_settings.pingpong = false;
+    worker_settings.stats_gap = ARG_INTEGER(app_args, "stats-gap", 24);
 
     /* Check batch size is valid */
     if (worker_settings.batch_size > MAX_BATCH_SIZE) {
@@ -437,7 +439,7 @@ save_ftuple_statistics_file()
     MAP_FOR_EACH(ftuple_stat_node, node, &ftuple_stats_map) {
         fprintf(file, "hash: %-11u 5-tuple: ", ftuple_stat_node->node.hash);
         ftuple_print(file, &ftuple_stat_node->ftuple);
-        fprintf(file, "rx-counter: %lu\n", ftuple_stat_node->counter);
+        fprintf(file, " rx-counter: %lu\n", ftuple_stat_node->counter);
         free(ftuple_stat_node);
     }
     map_destroy(&ftuple_stats_map);
@@ -705,7 +707,7 @@ main(int argc, char *argv[])
     rte_spinlock_init(&latency_lock);
     rte_spinlock_init(&ftuple_stats_map_lock);
     rte_spinlock_init(&srcip_stats_map_lock);
-    latency_vector = vector_init(sizeof(struct vector*));
+    latency_vector = vector_init(sizeof(uint64_t));
     map_init(&ftuple_stats_map, MAP_INITIAL_SIZE);
     map_init(&srcip_stats_map, MAP_INITIAL_SIZE);
 
@@ -748,7 +750,7 @@ main(int argc, char *argv[])
 /* Generate a packet batch acording to "worker_settings", fill "rte_mbufs".
  * The generator state "gen_state" is both read and updated.
  * Method is inline for compiler optimizations with "batch_size" */
-static inline void
+static inline int
 tx_generate_batch(struct rte_mbuf **rte_mbufs,
                   struct worker_settings *worker_settings,
                   void **gen_state,
@@ -770,6 +772,11 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
                                                 *gen_state,
                                                 &gen_data);
 
+        /* No further packets available */
+        if (!gen_data) {
+            return i;
+        }
+
         /* Fill "rte_mbufs[i]" with data according to the generator mode */
         if (worker_settings->generator_mode == GENERATOR_OUT_FTUPLE) {
             packet_generate_ftuple(rte_mbufs[i],
@@ -787,6 +794,8 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
         }
         (*packet_counter)++;
     }
+
+    return batch_size;
 }
 
 /* Sends "batch_size" packet from "rte_mbufs" according to "worker_settings".
@@ -802,7 +811,7 @@ tx_send_batch(struct rte_mbuf **rte_mbufs,
     uint16_t retval;
 
     /* If we're in pingpong mode, don't send packets unless we have an okay */
-    if (worker_settings->pingpong && !pingpong_send.val) {
+    if (worker_settings->pingpong && !&pingpong_send.val) {
         return 0;
     }
 
@@ -929,11 +938,6 @@ rx_receive_batch(const struct worker_settings *worker_settings,
        atomic_fetch_add(&rx_counter.val, packets);
     }
 
-    /* Update pingpong lock if enabled */
-    if (packets && worker_settings->pingpong) {
-        atomic_store(&pingpong_send.val, 1);
-    }
-
     return packets;
 }
 
@@ -959,6 +963,7 @@ rx_parse_packets(const struct worker_settings *worker_settings,
     int diff_counter;
     char *payload;
     int size;
+    int gap_valid;
 
     current_ns = get_time_ns();
     err_counter = 0;
@@ -989,8 +994,10 @@ rx_parse_packets(const struct worker_settings *worker_settings,
             diff_counter++;
         }
 
+        gap_valid = (!gap) || (i%gap == 0);
+
         /* Collect 5-tuple statistics */
-        if ((worker_settings->collect_ftuple_stats) && (i%gap==0)) {
+        if ((worker_settings->collect_ftuple_stats) && gap_valid) {
             stats_collect_ftuple(ftuple_stats, &ftuple, 1);
         }
 
@@ -1000,7 +1007,7 @@ rx_parse_packets(const struct worker_settings *worker_settings,
         }
 
         /* Update local vector every LATENCY_COLLECTOR_GAP packets */
-        if ((worker_settings->collect_latency_stats) && (i%gap==0)) {
+        if ((worker_settings->collect_latency_stats) && gap_valid) {
             vector_push(latency_stats, &latency_ns);
         }
     }
@@ -1120,12 +1127,12 @@ lcore_tx_worker(void *arg)
 
         /* Don't generate a new batch untill all previous packets were sent */
         if (!remaining_packets_to_send) {
-            tx_generate_batch(rte_mbufs,
-                              &worker_settings,
-                              &gen_state,
-                              &pkt_counter,
-                              worker_settings.batch_size);
-            remaining_packets_to_send = worker_settings.batch_size;
+            remaining_packets_to_send = 
+                tx_generate_batch(rte_mbufs,
+                                  &worker_settings,
+                                  &gen_state,
+                                  &pkt_counter,
+                                  worker_settings.batch_size);
         }
 
         retval = tx_send_batch(rte_mbufs,
@@ -1173,7 +1180,7 @@ lcore_rx_worker(void *arg)
     map_init(&ftuple_stats_local, MAP_INITIAL_SIZE);
     map_init(&srcip_stats_local, MAP_INITIAL_SIZE);
 
-    gap = MIN(LATENCY_COLLECTOR_GAP, worker_settings.batch_size);
+    gap = MIN(worker_settings.stats_gap, worker_settings.batch_size);
 
     while(running.val) {
         /* Get a batch of packets */
@@ -1191,6 +1198,11 @@ lcore_rx_worker(void *arg)
 
         /* Free allocated memory */
         rx_free_memory(rte_mbufs, packets);
+
+        /* Update pingpong lock if enabled */
+        if (packets && worker_settings.pingpong) {
+            atomic_store(&pingpong_send.val, 1);
+        }
 
         /* Leader prints to screen */
         rx_show_counter(core,

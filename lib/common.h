@@ -144,7 +144,7 @@ get_time_ns()
     struct timespec timespec;
     uint64_t value;
     clock_gettime(CLOCK_MONOTONIC, &timespec);
-    value = (timespec.tv_sec * 1e9 + timespec.tv_nsec);
+    value = ((uint64_t)timespec.tv_sec * 1e9 + timespec.tv_nsec);
     return value;
 }
 
