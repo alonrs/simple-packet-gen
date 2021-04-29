@@ -21,8 +21,6 @@
 #include "common.h"
 #include "device.h"
 
-#define MAX(A,B) (A) > (B) ? (A) : (B)
-
 /* Create a mempool of "size" bytes on "socket" */
 struct rte_mempool*
 create_mempool(int socket, int size, int num_elements) {

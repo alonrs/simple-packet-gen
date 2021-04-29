@@ -114,6 +114,10 @@
 #define ASSERT(CONDITION) ((void) (CONDITION))
 #endif
 
+#define MAX(A,B) (A) > (B) ? (A) : (B)
+#define MIN(A,B) (A) < (B) ? (A) : (B)
+
+
 /* Allocate or fail */
 static inline void*
 xmalloc(size_t size)
