@@ -34,9 +34,10 @@ enum { MAX_EAL_ARGS = 64 };
 struct worker_settings {
     generator_policy_func_t generator; /* Packet generator */
     generator_mode_t generator_mode;   /* RAW or 5-tuples */
+    double rate_limit;                 /* Zero stands for no limit */
     void *args;                        /* Generator custom arguments */
     int time_limit;                    /* Zero stands for no limit */
-    int rate_limit;                    /* Zero stands for no limit */
+    int tx_limit;                      /* Zero stands for no limit */
     int rate_stats;                    /* Report counters each X ns */
     bool pingpong;                     /* See arguments help for pingpong */
     bool collect_latency_stats;        /* Store latency results in vector */
@@ -108,10 +109,13 @@ static struct arguments app_args[] = {
                                  "between statistics measurements."},
 
 /* Limiters */
+{"tx-limit",       0, 0, "0",    "(Limiter) If VALUE>0, stops TX queues "
+                                 "after VALUE seconds."},
 {"time-limit",     0, 0, "0",    "(Limiter) If VALUE>0, stops application "
                                  "after VALUE seconds."},
 {"rate-limit",     0, 0, "0",    "(Limiter) If VALUE>0, limites TX rate to "
-                                 "be approximately VALUE Kpps."},
+                                 "be approximately value kpps. VALUE can be "
+                                 "a fraction."},
 
 /* Statistics */
 {"xstats",         0, 1, NULL,   "(NIC-stats) Show port xstats at the end."},
@@ -164,6 +168,7 @@ static struct arguments app_args[] = {
 
 /* Atomic messages accross cores, each a single cache line */
 MESSAGE_T(bool, running);
+MESSAGE_T(bool, tx_running);
 MESSAGE_T(long, tx_counter);
 MESSAGE_T(long, rx_counter);
 MESSAGE_T(long, rx_err_counter);
@@ -248,7 +253,8 @@ initialize_settings()
     worker_settings.collect_srcip_stats =
                                  ARG_BOOL(app_args, "srcip-stats", 0);
     worker_settings.time_limit = ARG_INTEGER(app_args, "time-limit", 0);
-    worker_settings.rate_limit = ARG_INTEGER(app_args, "rate-limit", 0);
+    worker_settings.tx_limit = ARG_INTEGER(app_args, "tx-limit", 0);
+    worker_settings.rate_limit = ARG_DOUBLE(app_args, "rate-limit", 0);
     worker_settings.batch_size = ARG_INTEGER(app_args, "batch-size", 64);
     worker_settings.pingpong = false;
     worker_settings.stats_gap = ARG_INTEGER(app_args, "stats-gap", 24);
@@ -691,11 +697,12 @@ main(int argc, char *argv[])
     initialize_dpdk();
 
     /* Initialize signal handler */
-    atomic_init(&running.val, true);
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
     /* Initialize counters, locks */
+    atomic_init(&running.val, true);
+    atomic_init(&tx_running.val, true);
     atomic_init(&tx_counter.val, 0);
     atomic_init(&rx_counter.val, 0);
     atomic_init(&rx_err_counter.val, 0);
@@ -811,7 +818,7 @@ tx_send_batch(struct rte_mbuf **rte_mbufs,
     uint16_t retval;
 
     /* If we're in pingpong mode, don't send packets unless we have an okay */
-    if (worker_settings->pingpong && !&pingpong_send.val) {
+    if (worker_settings->pingpong && !atomic_load(&pingpong_send.val)) {
         return 0;
     }
 
@@ -891,30 +898,22 @@ tx_show_counter(const int socket,
     last_timestamp = get_time_ns();
     (*sec_counter)++;
 
-    /* Time limit */
-    if (worker_settings->time_limit &&
-        (*sec_counter) >= worker_settings->time_limit) {
-        printf("Time limit has reached \n");
-        atomic_store(&running.val, false);
-    }
 }
 
-/* Allocate mbufs for TX */
 static inline void
-tx_allocate_mbufs(int socket,
-                  struct rte_mbuf **rte_mbufs,
-                  const int batch_size)
+tx_time_limit(const struct worker_settings *worker_settings,
+              int *sec_counter)
 {
-    struct rte_mempool *rte_mempool;
-    uint16_t retval;
+    if (worker_settings->time_limit &&
+        (*sec_counter) >= worker_settings->time_limit) {
+        printf("Time limit has reached. Stopping... \n");
+        atomic_store(&running.val, false);
+    }
 
-    /* Allocate memory */
-    rte_mempool = create_mempool(socket,
-                                 DEVICE_MEMPOOL_DEF_SIZE,
-                                 tx_settings.tx_descs*2);
-    retval = rte_pktmbuf_alloc_bulk(rte_mempool, rte_mbufs, batch_size);
-    if (retval) {
-        rte_exit(EXIT_FAILURE, "Failed to allocate mbuf \n");
+    if (worker_settings->tx_limit &&
+        (*sec_counter) >= worker_settings->tx_limit) {
+        printf("TX time limit has reached. Stopping TX queues... \n");
+        atomic_store(&tx_running.val, false);
     }
 }
 
@@ -1095,6 +1094,7 @@ lcore_tx_worker(void *arg)
     struct rte_mbuf *rte_mbufs[MAX_BATCH_SIZE];
     uint16_t remaining_packets_to_send;
     struct rate_limiter rate_limiter;
+    struct rte_mempool *rte_mempool;
     struct map srcip_stats_local;
     uint64_t pkt_counter;
     uint16_t retval;
@@ -1119,11 +1119,22 @@ lcore_tx_worker(void *arg)
                       worker_settings.batch_size,
                       worker_settings.tx_queue_num);
 
-    tx_allocate_mbufs(socket, rte_mbufs, worker_settings.batch_size);
+    /* Allocate mempool */
+    rte_mempool = create_mempool(socket,
+                                 DEVICE_MEMPOOL_DEF_SIZE,
+                                 tx_settings.tx_descs*2);
 
     map_init(&srcip_stats_local, MAP_INITIAL_SIZE);
 
-    while(running.val) {
+    while(running.val && tx_running.val) {
+
+        /* Allocate mbufs for current batch */
+        retval = rte_pktmbuf_alloc_bulk(rte_mempool,
+                                        rte_mbufs,
+                                        worker_settings.batch_size);
+        if (retval) {
+            rte_exit(EXIT_FAILURE, "Failed to allocate mbuf \n");
+        }
 
         /* Don't generate a new batch untill all previous packets were sent */
         if (!remaining_packets_to_send) {
@@ -1147,6 +1158,9 @@ lcore_tx_worker(void *arg)
                         &sec_counter);
 
         rate_limiter_wait(&rate_limiter);
+
+        /* Time limit */
+        tx_time_limit(&worker_settings, &sec_counter);
     }
 
     /* Push values from local map into global map */

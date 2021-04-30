@@ -9,13 +9,13 @@
 
 struct rate_limiter {
     uint64_t current_time;
+    double kpps;
     uint32_t batch_size;
-    uint32_t kpps;
 };
 
 static inline void
 rate_limiter_init(struct rate_limiter *rl,
-                  uint32_t kpps,
+                  double kpps,
                   uint32_t batch_size,
                   uint16_t num_tx_queues)
 {
