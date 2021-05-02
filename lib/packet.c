@@ -11,7 +11,6 @@
 #include "config.h"
 #include "common.h"
 #include "packet.h"
-#include "hash.h"
 
 #define IPVERSION 4
 

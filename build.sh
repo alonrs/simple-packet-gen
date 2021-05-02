@@ -4,7 +4,14 @@ dpdk_dir=$(readlink -f $(dirname $0))/dpdk
 build_dir=$dpdk_dir/build
 install_dir=$build_dir/install
 
+echo "Caching sudo..."
 sudo whoami
+
+if [[ ! -d libcommon/bin ]]; then
+    echo "Building libcommon..."
+    git submodule update --init
+    make -C libcommon
+fi
 
 # Fetch DPDK repository
 if [[ ! -d $dpdk_dir || -z $(ls $dpdk_dir/*) ]]; then

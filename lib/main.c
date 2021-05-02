@@ -11,11 +11,11 @@
 #include <rte_ethdev.h>
 #include <rte_spinlock.h>
 
+#include "libcommon/lib/arguments.h"
+#include "libcommon/lib/vector.h"
+#include "libcommon/lib/map.h"
 #include "config.h"
 #include "common.h"
-#include "arguments.h"
-#include "vector.h"
-#include "map.h"
 #include "packet.h"
 #include "device.h"
 #include "generator.h"

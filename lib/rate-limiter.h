@@ -4,7 +4,6 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <math.h>
-
 #include "common.h"
 
 struct rate_limiter {

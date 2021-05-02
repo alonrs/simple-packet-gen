@@ -6,7 +6,7 @@
 #include <rte_mbuf.h>
 #include <rte_ether.h>
 #include <rte_byteorder.h>
-#include "hash.h"
+#include "libcommon/lib/hash.h"
 
 /* Error types */
 #define READ_ERROR_UNSUPPORTED_PROTOCOL 1

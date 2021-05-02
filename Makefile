@@ -2,13 +2,13 @@ LIB_DIR ?= lib
 BIN_DIR ?= bin
 CC      ?= gcc
 PKGCONF ?= pkg-config
-CFLAGS  := -std=gnu11 -Wall -g
+CFLAGS  := -std=gnu11 -Wall -g -I.
 
 # Create bin directory and make submodule
 ifeq "$(wildcard $(BIN_DIR) )" ""
 $(info Creating makefile for all object files...)
 $(shell mkdir -p $(BIN_DIR))
-$(shell $(CC) -MM $(LIB_DIR)/*.c |                              \
+$(shell $(CC) -MM $(CFLAGS) $(LIB_DIR)/*.c |                    \
 sed -E "s@^(.*):@$(BIN_DIR)/\1:@g" |                            \
 awk 'NR>1&&/:/{printf "\t$$(CC) $$(CFLAGS) -o $$@ -c %s\n%s\n", \
 "$$(patsubst $(BIN_DIR)/%.o,$(LIB_DIR)/%.c,$$@)", $$0}          \
@@ -33,7 +33,7 @@ ifneq ($(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
 $(error "No installation of DPDK found. Did you run build.sh?")
 endif
 
-LDFLAGS:=-lm -lpcap
+LDFLAGS:=-lm -lpcap -Llibcommon/bin -lcommon
 LDFLAGS+=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
                  $(PKGCONF) --libs libdpdk)
 CFLAGS +=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \

@@ -4,8 +4,8 @@
 #include <netinet/in.h>
 #include <pcap/pcap.h>
 
+#include "libcommon/lib/random.h"
 #include "common.h"
-#include "random.h"
 #include "generator.h"
 
 #define STATE_KEY 1600
