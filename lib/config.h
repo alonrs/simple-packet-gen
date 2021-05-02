@@ -1,7 +1,7 @@
 #ifndef _CONFIG_H_
 #define _CONFIG_H_
 
-/* Debug flags */
+/* Print packets to stdout and to the PCAP file "out.pcap" */
 #define DEBUG_PRINT_PACKETS false
 
 /* Packet generation flags */
