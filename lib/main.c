@@ -43,6 +43,7 @@ struct worker_settings {
     bool collect_latency_stats;        /* Store latency results in vector */
     bool collect_ftuple_stats;         /* Store 5-tuple results in map */
     bool collect_srcip_stats;          /* Store srcip results in map */
+    bool compute_checksum;             /* Compute checksum for 5-tuples */
     uint16_t tx_leader_core_id;
     uint16_t rx_leader_core_id;
     uint16_t queue_index;
@@ -80,6 +81,7 @@ static struct arguments app_args[] = {
 {"tx-descs",       0, 0, "256",  "(Config) Number of TX descs."},
 {"rx-descs",       0, 0, "256",  "(Config) Number of RX descs."},
 {"batch-size",     0, 0, "64",   "(Config) Batch size for sending packets."},
+{"skip-checksum",  0, 1, NULL,   "(Config) Do not calculate checksums."},
 
 /* Special modes */
 {"ping-pong",      0, 1, NULL,   "(Mode) Enable ping-pong mode. The TX and RX "
@@ -258,6 +260,8 @@ initialize_settings()
     worker_settings.batch_size = ARG_INTEGER(app_args, "batch-size", 64);
     worker_settings.pingpong = false;
     worker_settings.stats_gap = ARG_INTEGER(app_args, "stats-gap", 24);
+    worker_settings.compute_checksum =
+                                !(ARG_BOOL(app_args, "skip-checksum", 0));
 
     /* Check batch size is valid */
     if (worker_settings.batch_size > MAX_BATCH_SIZE) {
@@ -790,6 +794,7 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
                                    &tx_settings.mac_addr,
                                    &rx_settings.mac_addr,
                                    PACKET_SIZE,
+                                   worker_settings->compute_checksum,
                                    (struct ftuple*)gen_data,
                                    (worker_settings->queue_index==0) &&
                                    DEBUG_PRINT_PACKETS);

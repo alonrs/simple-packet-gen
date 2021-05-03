@@ -44,6 +44,7 @@ void packet_generate_ftuple(struct rte_mbuf *mbuf,
                             struct rte_ether_addr *src_mac,
                             struct rte_ether_addr *dst_mac,
                             int size,
+                            bool compute_checksum,
                             struct ftuple *ftuple,
                             bool print_packet);
 

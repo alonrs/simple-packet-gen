@@ -54,6 +54,7 @@ packet_generate_ftuple(struct rte_mbuf *mbuf,
                        struct rte_ether_addr *src_mac,
                        struct rte_ether_addr *dst_mac,
                        int size,
+                       bool compute_checksum,
                        struct ftuple *ftuple,
                        bool should_print_packet)
 {
@@ -102,8 +103,6 @@ packet_generate_ftuple(struct rte_mbuf *mbuf,
     ipv4_hdr->hdr_checksum = 0;     /* Will be calculated next */
     ipv4_hdr->src_addr = ftuple->src_ip;
     ipv4_hdr->dst_addr = ftuple->dst_ip;
-
-    compute_ip_checksum(ipv4_hdr);
 
     /* Do we work with TCP? */
     if (ftuple->ip_proto == IPPROTO_TCP) {
@@ -170,13 +169,16 @@ packet_generate_ftuple(struct rte_mbuf *mbuf,
         memset(payload, 0, payload_size);
     }
 
-    /* Calculate L4 checksums */
-    if (ftuple->ip_proto == IPPROTO_TCP) {
-        compute_tcp_checksum(ipv4_hdr, tcp_hdr);
-    } else if (ftuple->ip_proto == IPPROTO_UDP) {
-        compute_udp_checksum(ipv4_hdr, udp_hdr);
-    } else if (ftuple->ip_proto == IPPROTO_ICMP) {
-        compute_icmp_checksum(ipv4_hdr, icmp_hdr);
+    /* Calculate checksums */
+    if (compute_checksum) {
+        compute_ip_checksum(ipv4_hdr);
+        if (ftuple->ip_proto == IPPROTO_TCP) {
+            compute_tcp_checksum(ipv4_hdr, tcp_hdr);
+        } else if (ftuple->ip_proto == IPPROTO_UDP) {
+            compute_udp_checksum(ipv4_hdr, udp_hdr);
+        } else if (ftuple->ip_proto == IPPROTO_ICMP) {
+            compute_icmp_checksum(ipv4_hdr, icmp_hdr);
+        }
     }
 
     /* Print packet -  debug */
