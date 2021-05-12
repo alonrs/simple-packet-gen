@@ -21,8 +21,8 @@
 #include "generator.h"
 #include "rate-limiter.h"
 
-#define FTUPLE_DEF_1 "6, 192.168.0.1, 10.0.0.1, 100, 200"
-#define FTUPLE_DEF_2 "6, 192.168.0.255, 10.0.0.255, 300, 400"
+#define FTUPLE_DEF_1 "6, 101.0.0.0, 100.0.0.1, 1000,1000"
+#define FTUPLE_DEF_2 "6, 101.0.0.0, 100.0.0.1, 1000,1000"
 #define MAP_INITIAL_SIZE 512
 
 static int lcore_tx_worker(void *arg);
@@ -36,6 +36,7 @@ struct worker_settings {
     generator_mode_t generator_mode;   /* RAW or 5-tuples */
     double rate_limit;                 /* Zero stands for no limit */
     void *args;                        /* Generator custom arguments */
+    uint64_t packet_limit;             /* Zero stands for no limit */
     int time_limit;                    /* Zero stands for no limit */
     int tx_limit;                      /* Zero stands for no limit */
     int rate_stats;                    /* Report counters each X ns */
@@ -115,6 +116,8 @@ static struct arguments app_args[] = {
                                  "after VALUE seconds."},
 {"time-limit",     0, 0, "0",    "(Limiter) If VALUE>0, stops application "
                                  "after VALUE seconds."},
+{"packet-limit",   0, 0, "0",    "(Limiter) If VALUE>0, stops TX queues "
+                                 "after VALUE packets have been sent."},
 {"rate-limit",     0, 0, "0",    "(Limiter) If VALUE>0, limites TX rate to "
                                  "be approximately value kpps. VALUE can be "
                                  "a fraction."},
@@ -128,10 +131,13 @@ static struct arguments app_args[] = {
                                  "superspreader policy. 'n1' knob controls "
                                  "the number of users (src-ips), 'n2' knob "
                                  "controls the number of unique destinations "
-                                 "(dst-ips). '5tuple' knob controls the basic "
-                                 "5-tuple for generating packets. Statistics  "
-                                 "per user can be "
-                                 "received using 'user-stats' knob."},
+                                 "(dst-ips). The src-ips are divided into "
+                                 "batches, s.t. each has 'n3' src-ips, "
+                                 "and 'n4' packets. There are 'txq' simul"
+                                 "taneous batchs. '5tuple' knob controls "
+                                 "the basic 5-tuple for generation packets. "
+                                 "Statistics per user can be "
+                                 "received using 'srcip-stats' knob."},
 {"p-nflows",       0, 1, NULL,   "(Policy) Generate packets s.t each packet "
                                  "is sent with a different src-ip and dst-ip. "
                                  "'n1' knob controls the number of unique "
@@ -157,6 +163,7 @@ static struct arguments app_args[] = {
 {"n1",             0, 0, "100",        "(Policy knob) 'n1' knob."},
 {"n2",             0, 0, "500",        "(Policy knob) 'n2' knob."},
 {"n3",             0, 0, "1",          "(Policy knob) 'n3' knob."},
+{"n4",             0, 0, "1",          "(Policy knob) 'n4' knob."},
 {"5tuple",         0, 0, FTUPLE_DEF_1, "(Policy knob) '5tuple' knob."},
 {"5tuple2",        0, 0, FTUPLE_DEF_2, "(Policy knob) '5tuple2' knob."},
 {"file",           0, 0, "",           "(Policy knob) 'file' knob."},
@@ -212,6 +219,7 @@ parse_policy_knobs()
     policy_knobs.n1 = ARG_DOUBLE(app_args, "n1", 100);
     policy_knobs.n2 = ARG_DOUBLE(app_args, "n2", 500);
     policy_knobs.n3 = ARG_DOUBLE(app_args, "n3", 1);
+    policy_knobs.n4 = ARG_DOUBLE(app_args, "n4", 1);
 
     str = ARG_STRING(app_args, "5tuple", FTUPLE_DEF_1);
     if (ftuple_parse(&policy_knobs.ftuple1, str)) {
@@ -256,6 +264,7 @@ initialize_settings()
                                  ARG_BOOL(app_args, "srcip-stats", 0);
     worker_settings.time_limit = ARG_INTEGER(app_args, "time-limit", 0);
     worker_settings.tx_limit = ARG_INTEGER(app_args, "tx-limit", 0);
+    worker_settings.packet_limit = ARG_INTEGER(app_args, "packet-limit", 0);
     worker_settings.rate_limit = ARG_DOUBLE(app_args, "rate-limit", 0);
     worker_settings.batch_size = ARG_INTEGER(app_args, "batch-size", 64);
     worker_settings.pingpong = false;
@@ -299,6 +308,8 @@ initialize_settings()
         policy = POLICY_SUPERSPREADER;
     } else if (ARG_BOOL(app_args, "p-nflows", 0)) {
         policy = POLICY_NFLOWS;
+    } else if (ARG_BOOL(app_args, "p-paths", 0)) {
+        policy = POLICY_PATHS;
     } else if (ARG_BOOL(app_args, "p-pcap", 0)) {
         policy = POLICY_PCAP;
     } else {
@@ -905,21 +916,33 @@ tx_show_counter(const int socket,
 
 }
 
-static inline void
+/* Returns true if the current TX queues should stop */
+static inline bool
 tx_time_limit(const struct worker_settings *worker_settings,
-              int *sec_counter)
+              int sec_counter,
+              uint64_t packet_counter)
 {
     if (worker_settings->time_limit &&
-        (*sec_counter) >= worker_settings->time_limit) {
+        sec_counter >= worker_settings->time_limit) {
         printf("Time limit has reached. Stopping... \n");
         atomic_store(&running.val, false);
     }
 
     if (worker_settings->tx_limit &&
-        (*sec_counter) >= worker_settings->tx_limit) {
+        sec_counter >= worker_settings->tx_limit) {
         printf("TX time limit has reached. Stopping TX queues... \n");
         atomic_store(&tx_running.val, false);
     }
+
+    if (worker_settings->packet_limit &&
+        packet_counter >= worker_settings->packet_limit) {
+        printf("TX packet limit %lu has reached. Stopping TX queues... \n",
+              worker_settings->packet_limit);
+        return true;
+    }
+
+    /* Don't stop locally; global falgs may still cause application to stop */
+    return false;
 }
 
 /* Receive a "batch_size" incoming packets into "rte_mbufs" according to the
@@ -1124,6 +1147,12 @@ lcore_tx_worker(void *arg)
                       worker_settings.batch_size,
                       worker_settings.tx_queue_num);
 
+    /* Packet limit is divided by the number of TX queues */
+    worker_settings.packet_limit =
+        worker_settings.queue_index ? 
+        floor((double)worker_settings.packet_limit / tx_settings.tx_queues) :
+        ceil((double)worker_settings.packet_limit / tx_settings.tx_queues);
+
     /* Allocate mempool */
     rte_mempool = create_mempool(socket,
                                  DEVICE_MEMPOOL_DEF_SIZE,
@@ -1165,7 +1194,9 @@ lcore_tx_worker(void *arg)
         rate_limiter_wait(&rate_limiter);
 
         /* Time limit */
-        tx_time_limit(&worker_settings, &sec_counter);
+        if (tx_time_limit(&worker_settings, sec_counter, pkt_counter)) {
+            break;
+        }
     }
 
     /* Push values from local map into global map */
@@ -1224,8 +1255,7 @@ lcore_rx_worker(void *arg)
         }
 
         /* Leader prints to screen */
-        rx_show_counter(core,
-                        &worker_settings);
+        rx_show_counter(core, &worker_settings);
     }
 
     /* Push values from local vector into the global vector */

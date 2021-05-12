@@ -25,6 +25,7 @@ struct policy_knobs {
     double n1;
     double n2;
     double n3;
+    double n4;
     struct ftuple ftuple1;
     struct ftuple ftuple2;
     const char *file;

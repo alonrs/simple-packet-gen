@@ -100,6 +100,11 @@ port_init(struct port_settings *settings)
             .max_rx_pkt_len = RTE_ETHER_MAX_LEN,
             .offloads = DEV_RX_OFFLOAD_CHECKSUM
         },
+        .txmode = {
+            .offloads = DEV_TX_OFFLOAD_IPV4_CKSUM |
+                        DEV_TX_OFFLOAD_UDP_CKSUM  |
+                        DEV_TX_OFFLOAD_TCP_CKSUM
+        }
     };
 
     if (dev_info.tx_offload_capa & DEV_TX_OFFLOAD_MBUF_FAST_FREE) {

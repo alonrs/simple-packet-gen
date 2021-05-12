@@ -26,10 +26,15 @@ generator_policy_superspreader(uint64_t pkt_num,
     /* Thread specfic state */
     struct {
         struct policy_knobs knobs;
+        uint64_t phase_counter;        /* Counter packets for phase */
+        uint64_t packets_per_phase;    /* Number of packets per phase */
         uint32_t src_ip;
         uint32_t dst_ip;
         int src_counter;
         int dst_counter;
+        int phase_src_end;        /* src-ip start value for phase */
+        int phase_src_start;      /* src-ip end value for phase */
+        int phase_srcip_num;      /* Number of sources IPs per phase */
     } *state;
 
     /* First packet, parse initial args, set state */
@@ -42,16 +47,21 @@ generator_policy_superspreader(uint64_t pkt_num,
                            false);
         state->src_ip = rte_be_to_cpu_32(state->knobs.ftuple1.src_ip);
         state->dst_ip = rte_be_to_cpu_32(state->knobs.ftuple1.dst_ip);
-        state->src_counter = 0;
+        state->packets_per_phase = state->knobs.n4;
+        state->phase_srcip_num = state->knobs.n3 * queue_total;
+        state->src_counter = queue_idx;
         state->dst_counter = 0;
+        state->phase_src_start = 0;
+        state->phase_src_end = state->phase_srcip_num;
+        state->phase_counter = 0;
     }
     /* Get state from args */
     else {
         state = args;
     }
 
-    if (state->src_counter >= state->knobs.n1) {
-        state->src_counter = 0;
+    if (state->src_counter >= state->phase_src_end) {
+        state->src_counter = state->phase_src_start + queue_idx;
         state->dst_counter++;
     }
 
@@ -61,12 +71,29 @@ generator_policy_superspreader(uint64_t pkt_num,
 
     /* Update 5-tuple values */
     state->knobs.ftuple1.src_ip =
-            rte_cpu_to_be_32(state->src_ip + state->src_counter);
+            rte_cpu_to_be_32(state->src_ip + state->src_counter * 0x010000);
     state->knobs.ftuple1.dst_ip =
-            rte_cpu_to_be_32(state->dst_ip + state->dst_counter);
+            rte_cpu_to_be_32(state->src_ip + state->src_counter * 0x010000 + 
+                             state->dst_counter);
 
-    /* Update counter */
-    state->src_counter++;
+    /* Update counters */
+    state->src_counter += queue_total;
+    state->phase_counter++;
+
+    /* Update pbatch. */
+    if (state->phase_counter >= state->packets_per_phase) {
+        state->phase_counter = 0;
+        state->phase_src_start += state->phase_srcip_num;
+        state->phase_src_end += state->phase_srcip_num;
+        if (state->phase_src_start >= state->knobs.n1) {
+            state->phase_src_start = 0;
+            state->phase_src_end = state->phase_srcip_num;
+        }
+        if (state->phase_src_end >= state->knobs.n1) {
+            state->phase_src_end = state->knobs.n1;
+        }
+        state->src_counter = state->phase_src_start + queue_idx; 
+    }
 
     /* Output is a pointer to the 5-tuple */
     *out = &state->knobs.ftuple1;
@@ -137,10 +164,12 @@ generator_policy_paths(uint64_t pkt_num,
     /* Thread specfic state */
     struct {
         struct policy_knobs knobs;
+        uint32_t ip;
+        int counter;
         uint64_t timestamp;
         int phase;
+        int p;
     } *state;
-    double p;
 
     /* First packet, parse initial args, set state */
     if (!pkt_num) {
@@ -150,29 +179,49 @@ generator_policy_paths(uint64_t pkt_num,
                            args,
                            sizeof(struct policy_knobs),
                            false);
-        state->knobs.n3 *= 1e6; /* From ms to ns */
+        state->knobs.n3 *= 1e6; /* From us to ns */
+        state->ip = rte_be_to_cpu_32(state->knobs.ftuple1.src_ip);
+        state->counter = 0;
         state->timestamp = get_time_ns();
         state->phase = 0;
+        state->knobs.n1 *= queue_total;
+        state->knobs.n2 *= queue_total;
+        state->p = state->knobs.n1;
     }
     /* Get state from args */
     else {
         state = args;
     }
 
+    if (state->counter > state->knobs.n4) {
+        state->counter = 0;
+    }
+
+    /* Update 5-tuple values */
+    state->knobs.ftuple1.src_ip = rte_cpu_to_be_32(state->ip + state->counter);
+
     /* Change phase? */
     if (get_time_ns() - state->timestamp >= state->knobs.n3) {
-        state->phase = (state->phase+1)&0x1;
+        state->phase = !state->phase;
         state->timestamp = get_time_ns();
+        state->p = (!state->phase) ? state->knobs.n1 : state->knobs.n2;
     }
 
     /* Choose path by probability */
     /* Output is a pointer to the 5-tuple */
-    p = (!state->phase) ? state->knobs.n1 : state->knobs.n2;
-    if (random_coin(p)) {
-        *out = &state->knobs.ftuple1;
+    if (queue_idx < state->p) {
+    	*out = &state->knobs.ftuple1;
+        /* state->knobs.ftuple1.src_port = rte_cpu_to_be_16(1000); */
     } else {
-        *out = &state->knobs.ftuple2;
+    	*out = &state->knobs.ftuple2;
+        /* state->knobs.ftuple1.src_port = rte_cpu_to_be_16(2000); */
     }
+
+    /* Update counter */
+    state->counter++;
+
+    /* Output is a pointer to the 5-tuple */
+    *out = &state->knobs.ftuple1;
 
     return state;
 }
