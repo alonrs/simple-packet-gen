@@ -17,7 +17,8 @@ typedef enum {
     POLICY_SUPERSPREADER,
     POLICY_NFLOWS,
     POLICY_PATHS,
-    POLICY_PCAP
+    POLICY_PCAP,
+    POLICY_MAPPING
 } policy_t;
 
 /* Policy knobs set by command line, filled by in "main.c" */
@@ -28,7 +29,10 @@ struct policy_knobs {
     double n4;
     struct ftuple ftuple1;
     struct ftuple ftuple2;
-    const char *file;
+    const char *file1;
+    const char *file2;
+    const char *file3;
+    void *args;
 };
 
 /* Output values for raw packet */
@@ -88,4 +92,13 @@ void* generator_policy_pcap(uint64_t pkt_num,
                             uint16_t queue_total,
                             void *args,
                             void **out);
+
+/* (GENERATOR_OUT_FTUPLE) Generates 5-tuple from external, textual mapping
+ * files. */
+void* generator_policy_mapping(uint64_t pkt_num,
+                               uint16_t queue_idx,
+                               uint16_t queue_total,
+                               void *args,
+                               void **out);
+
 #endif

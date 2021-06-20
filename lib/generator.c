@@ -7,6 +7,7 @@
 #include "libcommon/lib/random.h"
 #include "common.h"
 #include "generator.h"
+#include "trace-mapping.h"
 
 #define STATE_KEY 1600
 
@@ -264,7 +265,7 @@ generator_policy_pcap(uint64_t pkt_num,
                            args,
                            sizeof(struct policy_knobs),
                            false);
-        state->p = pcap_open_offline(knobs.file, error);
+        state->p = pcap_open_offline(knobs.file1, error);
         if (!state->p) {
             printf("Cannot open PCAP file: %s\n", error);
             exit(EXIT_FAILURE);
@@ -289,6 +290,59 @@ generator_policy_pcap(uint64_t pkt_num,
     } else {
         /* Return a pointer to raw packet */
         *out = &state->raw;
+    }
+
+    return state;
+}
+
+void*
+generator_policy_mapping(uint64_t pkt_num,
+                         uint16_t queue_idx,
+                         uint16_t queue_total,
+                         void *args,
+                         void **out)
+{
+    /* Thread specific state */
+    struct {
+        struct trace_mapping *trace_mapping;
+        int idx;
+        struct ftuple ftuple;
+    } *state;
+    int retval;
+
+    /* First packet, parse initial args, set state */
+    if (!pkt_num) {
+        /* Memory allocation per queue (core) */
+        state = xmalloc(sizeof(*state));
+        memset(state, 0, sizeof(*state));
+
+        /* Initialize values */
+        struct policy_knobs knobs;
+        get_void_arg_bytes(&knobs,
+                           args,
+                           sizeof(struct policy_knobs),
+                           false);
+        state->trace_mapping = (struct trace_mapping*)knobs.args;
+        state->idx = queue_idx;
+    }
+    /* Get state from args */
+    else {
+        state = args;
+    }
+
+    /* Get next 5-tuple */
+    retval = trace_mapping_get_next(state->trace_mapping,
+                                    &state->ftuple,
+                                    &state->idx,
+                                    queue_total);
+
+    /* In case no more packets */
+    if (retval) {
+        *out = NULL;
+    }
+    /* Output is a pointer to the 5-tuple */
+    else {
+        *out = (void*)&state->ftuple;
     }
 
     return state;

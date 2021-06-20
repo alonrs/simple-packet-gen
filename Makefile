@@ -3,6 +3,7 @@ BIN_DIR ?= bin
 CC      ?= gcc
 PKGCONF ?= pkg-config
 CFLAGS  := -std=gnu11 -Wall -g -I.
+LDFLAGS :=-lm -lpcap -Llibcommon/bin -lcommon -lpthread
 
 # Create bin directory and make submodule
 ifeq "$(wildcard $(BIN_DIR) )" ""
@@ -33,7 +34,6 @@ ifneq ($(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
 $(error "No installation of DPDK found. Did you run build.sh?")
 endif
 
-LDFLAGS:=-lm -lpcap -Llibcommon/bin -lcommon
 LDFLAGS+=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \
                  $(PKGCONF) --libs libdpdk)
 CFLAGS +=$(shell export PKG_CONFIG_PATH=$(PKG_CONFIG_PATH) && \

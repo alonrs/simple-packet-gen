@@ -20,6 +20,7 @@
 #include "device.h"
 #include "generator.h"
 #include "rate-limiter.h"
+#include "trace-mapping.h"
 
 #define FTUPLE_DEF_1 "6, 101.0.0.0, 100.0.0.1, 1000,1000"
 #define FTUPLE_DEF_2 "6, 101.0.0.0, 100.0.0.1, 1000,1000"
@@ -134,7 +135,7 @@ static struct arguments app_args[] = {
                                  "(dst-ips). The src-ips are divided into "
                                  "batches, s.t. each has 'n3' src-ips, "
                                  "and 'n4' packets. There are 'txq' simul"
-                                 "taneous batchs. '5tuple' knob controls "
+                                 "taneous batches. '5tuple' knob controls "
                                  "the basic 5-tuple for generation packets. "
                                  "Statistics per user can be "
                                  "received using 'srcip-stats' knob."},
@@ -153,11 +154,22 @@ static struct arguments app_args[] = {
                                  "to be one of two adjustable values. "
                                  "'n1' knob sets the first probability. "
                                  "'n2' knob sets the second probability. "
-                                 "'n3' knob controls the change freqency. "
+                                 "'n3' knob controls the change frequency. "
                                  "'5tuple' knob sets the first 5-tuple. "
                                  "'5tuple2' knob sets the second 5-tuple. "},
 {"p-pcap",         0, 1, NULL,   "(Policy) Read packets from a PCAP file. "
-                                 "'file' knob controls the PCAP filename. "},
+                                 "'file1' knob controls the PCAP filename. "},
+{"p-mapping",      0, 1, NULL,   "(Policy) Load 5-tuple mapping from external, "
+                                 "textual files. 'file1' knob controls the "
+                                 "mapping filename (required). 'file2' knob "
+                                 "controls the timestamp filename (optional). "
+                                 "'file3' knob controls the locality filename "
+                                 "(optional). 'n1' knob controls the number of "
+                                 "workers. If 'file3' knob is not set, "
+                                 "the mapping would have a uniform locality "
+                                 "with 'n2' knob to control the number of "
+                                 "packets, and 'n3' knob to control the number "
+                                 "of unique flows."},
 
 /* Policy knobs */
 {"n1",             0, 0, "100",        "(Policy knob) 'n1' knob."},
@@ -166,7 +178,9 @@ static struct arguments app_args[] = {
 {"n4",             0, 0, "1",          "(Policy knob) 'n4' knob."},
 {"5tuple",         0, 0, FTUPLE_DEF_1, "(Policy knob) '5tuple' knob."},
 {"5tuple2",        0, 0, FTUPLE_DEF_2, "(Policy knob) '5tuple2' knob."},
-{"file",           0, 0, "",           "(Policy knob) 'file' knob."},
+{"file1",          0, 0, NULL,         "(Policy knob) 'file1' knob."},
+{"file2",          0, 0, NULL,         "(Policy knob) 'file2' knob."},
+{"file3",          0, 0, NULL,         "(Policy knob) 'file3' knob."},
 
 /* Sentinel */
 {NULL,             0, 0, NULL,   "Send and receive packets using DPDK. "
@@ -233,7 +247,13 @@ parse_policy_knobs()
         exit(EXIT_FAILURE);
     }
 
-    policy_knobs.file = ARG_STRING(app_args, "file", "");
+    policy_knobs.file1 = ARG_STRING(app_args, "file1", "");
+    policy_knobs.file2 = ARG_STRING(app_args, "file2", "");
+    policy_knobs.file3 = ARG_STRING(app_args, "file3", "");
+
+    /* Additional arguments */
+    policy_knobs.args = NULL;
+
     return policy_knobs;
 }
 
@@ -241,6 +261,10 @@ parse_policy_knobs()
 static void
 initialize_settings()
 {
+    struct trace_mapping *trace_mapping;
+    struct policy_knobs policy_knobs;
+    policy_t policy;
+
     /* Initialize port settings */
     memset(&tx_settings, 0, sizeof(tx_settings));
     memset(&rx_settings, 0, sizeof(rx_settings));
@@ -303,7 +327,7 @@ initialize_settings()
     worker_settings.rate_stats *= 1e6;
 
     /* Set generator policy */
-    policy_t policy = POLICY_UNDEFINED;
+    policy = POLICY_UNDEFINED;
     if (ARG_BOOL(app_args, "p-superspreader", 0)) {
         policy = POLICY_SUPERSPREADER;
     } else if (ARG_BOOL(app_args, "p-nflows", 0)) {
@@ -312,14 +336,14 @@ initialize_settings()
         policy = POLICY_PATHS;
     } else if (ARG_BOOL(app_args, "p-pcap", 0)) {
         policy = POLICY_PCAP;
+    } else if (ARG_BOOL(app_args, "p-mapping", 0)) {
+        policy = POLICY_MAPPING;
     } else {
         printf("Packet generation policy was not given. Using default. \n");
     }
 
     /* Set the policy knobs */
-    struct policy_knobs policy_knobs = parse_policy_knobs();
-    worker_settings.args = alloc_void_arg_bytes(&policy_knobs,
-                                                sizeof(policy_knobs));
+    policy_knobs = parse_policy_knobs();
 
     switch (policy) {
     case POLICY_NFLOWS:
@@ -347,9 +371,24 @@ initialize_settings()
         break;
     case POLICY_PCAP:
         printf("Using PCAP policy. reading PCAP from \"%s\"\n",
-               policy_knobs.file);
+               policy_knobs.file1);
         worker_settings.generator = generator_policy_pcap;
         worker_settings.generator_mode = GENERATOR_OUT_RAW;
+        break;
+    case POLICY_MAPPING:
+        printf("Using mapping policy.\n");
+
+        trace_mapping = trace_mapping_init(policy_knobs.file3,
+                                           policy_knobs.file1,
+                                           policy_knobs.file2,
+                                           policy_knobs.n2,
+                                           policy_knobs.n3,
+                                           policy_knobs.n1);
+        trace_mapping_start(trace_mapping);
+
+        policy_knobs.args = trace_mapping;
+        worker_settings.generator = generator_policy_mapping;
+        worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
         break;
     case POLICY_SUPERSPREADER:
     default:
@@ -363,6 +402,9 @@ initialize_settings()
         worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
         break;
     }
+
+    worker_settings.args = alloc_void_arg_bytes(&policy_knobs,
+                                                sizeof(policy_knobs));
 }
 
 /* Initialzie DPDK from EAL arguments */
