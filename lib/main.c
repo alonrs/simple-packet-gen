@@ -194,6 +194,8 @@ MESSAGE_T(bool, running);
 MESSAGE_T(bool, tx_running);
 MESSAGE_T(long, tx_counter);
 MESSAGE_T(long, rx_counter);
+MESSAGE_T(long, drop_tx_counter);
+MESSAGE_T(long, drop_rx_counter);
 MESSAGE_T(long, rx_err_counter);
 MESSAGE_T(int, pingpong_send);
 
@@ -761,6 +763,8 @@ main(int argc, char *argv[])
     atomic_init(&running.val, true);
     atomic_init(&tx_running.val, true);
     atomic_init(&tx_counter.val, 0);
+    atomic_init(&drop_tx_counter.val, 0);
+    atomic_init(&drop_rx_counter.val, 0);
     atomic_init(&rx_counter.val, 0);
     atomic_init(&rx_err_counter.val, 0);
     atomic_init(&latency_counter, 0);
@@ -896,6 +900,7 @@ tx_send_batch(struct rte_mbuf **rte_mbufs,
     /* Update TX counter */
     if (retval > 0) {
         atomic_fetch_add(&tx_counter.val, retval);
+        atomic_fetch_add(&drop_tx_counter.val, retval);
     }
 
     /* Collect srcip TX statistics */
@@ -1005,6 +1010,7 @@ rx_receive_batch(const struct worker_settings *worker_settings,
     /* Update RX counters */
     if (packets > 0) {
        atomic_fetch_add(&rx_counter.val, packets);
+       atomic_fetch_add(&drop_rx_counter.val, packets);
     }
 
     return packets;
@@ -1114,7 +1120,10 @@ rx_show_counter(const int core,
     double diff_ns;
     double mpps;
     double avg_latency_usec;
+    double drop_percent;
     long counter;
+    long drop_tx_cnt;
+    long drop_rx_cnt;
     long err_counter;
     long diff_total;
     long diff_counter;
@@ -1140,6 +1149,10 @@ rx_show_counter(const int core,
     mpps = (double)counter/1e6/diff_ns;
     err_counter = atomic_exchange(&rx_err_counter.val, 0);
 
+    drop_tx_cnt = atomic_exchange(&drop_tx_counter.val, 0);
+    drop_rx_cnt = atomic_exchange(&drop_rx_counter.val, 0);
+    drop_percent = (1.0 - (double)drop_rx_cnt / drop_tx_cnt) * 100;
+
     /* Calc avg latency */
     rte_spinlock_lock(&latency_lock);
     diff_total = atomic_exchange(&latency_total, 0);
@@ -1148,11 +1161,13 @@ rx_show_counter(const int core,
             (double)diff_total / diff_counter / 1e3;
     rte_spinlock_unlock(&latency_lock);
 
-    printf("RX %.4lf %s, errors: %lu, avg. latency %.1lf usec\n",
+    printf("RX %.4lf %s, errors: %lu, avg. latency %.1lf usec, "
+           "drops: %.3lf %%\n",
            mpps,
            worker_settings->unit_stats,
            err_counter,
-           avg_latency_usec);
+           avg_latency_usec,
+           drop_percent);
     last_timestamp = get_time_ns();
 }
 
