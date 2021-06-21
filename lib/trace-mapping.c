@@ -395,7 +395,7 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
     uint64_t diff_ts;
 
     ring = &trace_mapping->ring[*idx];
-    last = &trace_mapping->ring[*idx == 0 ? RING_SIZE - 1 : *idx - 1];
+    last = &trace_mapping->ring[(*idx - txq) % RING_SIZE];
     while (ring->status == RING_ELEMENT_STATUS_EMPTY) {
         if (trace_mapping->stop) {
             return 1;
@@ -403,7 +403,7 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
     }
 
     /* Inter packet delays are in micro second */
-    diff_ts = ring->timestamp - last->timestamp;
+    diff_ts = last->timestamp == 0 ? 0 : ring->timestamp - last->timestamp;
     wait_until = trace_mapping->timestamp + diff_ts;
     while (get_time_ns() < wait_until);
 
