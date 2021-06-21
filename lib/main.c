@@ -10,6 +10,7 @@
 #include <pcap/pcap.h>
 #include <rte_ethdev.h>
 #include <rte_spinlock.h>
+#include <unistd.h>
 
 #include "libcommon/lib/arguments.h"
 #include "libcommon/lib/vector.h"
@@ -191,6 +192,7 @@ static struct arguments app_args[] = {
 
 /* Atomic messages accross cores, each a single cache line */
 MESSAGE_T(bool, running);
+MESSAGE_T(long, finalize);
 MESSAGE_T(bool, tx_running);
 MESSAGE_T(long, tx_counter);
 MESSAGE_T(long, rx_counter);
@@ -215,14 +217,108 @@ static struct port_settings tx_settings;
 static struct port_settings rx_settings;
 static struct worker_settings worker_settings;
 
-/* Force quit on SIGINT or SIGTERM */
+/* Packet generation policy */
+static policy_t policy;
+
+/* Restore state after signal */
+atomic_long signal_pause;
+atomic_long signal_counter;
+atomic_long signal_ratelimiter;
+atomic_long signal_workers; 
+volatile bool signal_restart;
+
+/* Static method declaration */
+static void register_signals();
+
+/* Initialize atomic counters */
 static void
-signal_handler(int signum)
+initialize_counters()
 {
-    if (signum == SIGINT || signum == SIGTERM) {
-        printf("Signal %d received, preparing to exit...\n", signum);
+    atomic_init(&tx_running.val, true);
+    atomic_init(&tx_counter.val, 0);
+    atomic_init(&drop_tx_counter.val, 0);
+    atomic_init(&drop_rx_counter.val, 0);
+    atomic_init(&rx_counter.val, 0);
+    atomic_init(&rx_err_counter.val, 0);
+    atomic_init(&latency_counter, 0);
+    atomic_init(&latency_total, 0);
+    atomic_init(&pingpong_timestamp, 0);
+    atomic_init(&pingpong_send.val, 1);
+}
+
+/* Initialize signal parameters */
+static void
+initialize_signal_parameters()
+{
+    atomic_init(&signal_pause, 0);
+    atomic_init(&signal_restart, false);
+    atomic_init(&signal_ratelimiter, 0);
+}
+
+/* Force quit */
+static void
+signal_sigterm(int signum)
+{
+    printf("\n");
+    fflush(stdout);
+    atomic_store(&signal_pause, 0);
+    atomic_store(&running.val, false);
+}
+
+/* Pause on SIGINT */
+static void
+signal_sigint(int signum)
+{
+    int retval;
+    int rate;
+    char ans;
+
+    signal(SIGINT, signal_sigterm);
+    atomic_store(&signal_pause, 1);
+
+    ask_again:
+    printf("%s", "\rWhat would you wish to do? "
+         "Continue [C]; Stop [S]; Reset with rate limiter [T]; "
+         "Restart [R] : ");
+    ans = getchar();
+    ans = tolower(ans);
+
+    switch (ans) {
+    case 'c':
+        break;
+    case 's':
         atomic_store(&running.val, false);
+        break;
+    case 't':
+        do {
+            printf("%s", "Enter new rate in Kpps: ");
+            retval = scanf("%d", &rate);
+        } while (retval != 1);
+        initialize_counters();
+        atomic_store(&signal_restart, true);
+        atomic_store(&signal_ratelimiter, rate);
+        break;
+    case 'r':
+        initialize_counters();
+        atomic_store(&signal_restart, true);
+        break;
+    default:
+        goto ask_again;
     }
+
+    /* "signal_counter" is like a semaphore for counting how many TX workers
+     * have received the signal messages */
+    atomic_store(&signal_counter, atomic_load(&signal_workers));
+    atomic_store(&signal_pause, 2);
+    register_signals();
+}
+
+/* Register the signals with singal_handler method */
+static void
+register_signals()
+{
+    signal(SIGINT, signal_sigint);
+    signal(SIGTERM, signal_sigterm);
 }
 
 /* Get "policy_knobs" from user */
@@ -265,7 +361,6 @@ initialize_settings()
 {
     struct trace_mapping *trace_mapping;
     struct policy_knobs policy_knobs;
-    policy_t policy;
 
     /* Initialize port settings */
     memset(&tx_settings, 0, sizeof(tx_settings));
@@ -407,6 +502,27 @@ initialize_settings()
 
     worker_settings.args = alloc_void_arg_bytes(&policy_knobs,
                                                 sizeof(policy_knobs));
+}
+
+/* Close objects related to arguments */
+static void
+finalize_settings()
+{
+    struct policy_knobs *knobs;
+    knobs = (struct policy_knobs*)worker_settings.args;
+
+    /* Perform operation only once */
+    if (atomic_fetch_add(&finalize.val, 1)) {
+        return;
+    }
+
+    switch (policy) {
+    case POLICY_MAPPING:
+        trace_mapping_destroy((struct trace_mapping*)knobs->args);
+        break;
+    default:
+        break;
+    }
 }
 
 /* Initialzie DPDK from EAL arguments */
@@ -756,22 +872,10 @@ main(int argc, char *argv[])
     initialize_dpdk();
 
     /* Initialize signal handler */
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    register_signals();
 
     /* Initialize counters, locks */
-    atomic_init(&running.val, true);
-    atomic_init(&tx_running.val, true);
-    atomic_init(&tx_counter.val, 0);
-    atomic_init(&drop_tx_counter.val, 0);
-    atomic_init(&drop_rx_counter.val, 0);
-    atomic_init(&rx_counter.val, 0);
-    atomic_init(&rx_err_counter.val, 0);
-    atomic_init(&latency_counter, 0);
-    atomic_init(&latency_total, 0);
-    atomic_init(&pingpong_timestamp, 0);
-    atomic_init(&pingpong_send.val, 1);
-
+    initialize_counters();
     rte_spinlock_init(&latency_lock);
     rte_spinlock_init(&ftuple_stats_map_lock);
     rte_spinlock_init(&srcip_stats_map_lock);
@@ -779,6 +883,13 @@ main(int argc, char *argv[])
     map_init(&ftuple_stats_map, MAP_INITIAL_SIZE);
     map_init(&srcip_stats_map, MAP_INITIAL_SIZE);
 
+    /* Initialize signal arguments */
+    atomic_init(&running.val, true);
+    atomic_init(&finalize.val, 0);
+    atomic_init(&signal_counter, 0);
+    atomic_init(&signal_workers, 0);
+    initialize_signal_parameters();
+    
     /* Check that there is an even number of ports to send/receive on. */
     if (rte_eth_dev_count_avail() < 2) {
         rte_exit(EXIT_FAILURE, "Error: number of ports is not 2. "
@@ -1182,6 +1293,7 @@ lcore_tx_worker(void *arg)
     struct rte_mempool *rte_mempool;
     struct map srcip_stats_local;
     uint64_t pkt_counter;
+    bool updated_signal;
     uint16_t retval;
     int socket, core;
     int sec_counter;
@@ -1193,6 +1305,7 @@ lcore_tx_worker(void *arg)
     sec_counter = 0;
     remaining_packets_to_send = 0;
     gen_state = NULL;
+    updated_signal = false;
 
     get_void_arg_bytes(&worker_settings,
                        arg,
@@ -1203,6 +1316,8 @@ lcore_tx_worker(void *arg)
                       worker_settings.rate_limit,
                       worker_settings.batch_size,
                       worker_settings.tx_queue_num);
+
+    atomic_fetch_add(&signal_workers, 1);
 
     /* Packet limit is divided by the number of TX queues */
     worker_settings.packet_limit =
@@ -1219,12 +1334,50 @@ lcore_tx_worker(void *arg)
 
     while(running.val && tx_running.val) {
 
+        /* Paused on signal */
+        if (signal_pause == 1) {
+            updated_signal = false;
+            usleep(100);
+            continue;
+        } else if (signal_pause == 2 && updated_signal) {
+            usleep(100);
+            continue;
+        } else if (signal_pause == 2 && !updated_signal) {
+           worker_settings.tx_queue_num = atomic_load(&signal_workers);
+
+            /* Act according to signal parameters */
+            if (atomic_load(&signal_restart)) {
+                pkt_counter = 0;
+                remaining_packets_to_send = 0;
+                sec_counter = 0;
+            }
+            if (atomic_load(&signal_ratelimiter)) {
+                rate_limiter_init(&rate_limiter,
+                                  signal_ratelimiter,
+                                  worker_settings.batch_size,
+                                  worker_settings.tx_queue_num);
+            }
+
+            /* Wait for all other TX workers before resuming... */
+            retval = atomic_fetch_sub(&signal_counter, 1);
+            updated_signal = true;
+
+            /* Last worker resets the pause signal */
+            if (retval == 1) {
+                initialize_signal_parameters();
+            }
+            continue;
+        }
+
         /* Allocate mbufs for current batch */
         retval = rte_pktmbuf_alloc_bulk(rte_mempool,
                                         rte_mbufs,
                                         worker_settings.batch_size);
         if (retval) {
-            rte_exit(EXIT_FAILURE, "Failed to allocate mbuf \n");
+            atomic_fetch_sub(&signal_workers, 1);
+            printf("** RTE Error: failed to allocate mbuf on TX queue %d **\n",
+                   worker_settings.queue_index);
+            break;
         }
 
         /* Don't generate a new batch untill all previous packets were sent */
@@ -1259,6 +1412,8 @@ lcore_tx_worker(void *arg)
     /* Push values from local map into global map */
     stats_fill_srcip_map(&worker_settings, &srcip_stats_local, true);
     map_destroy(&srcip_stats_local);
+    printf("TX worker %d exit \n", worker_settings.queue_index);
+    finalize_settings();
 
     return 0;
 }
@@ -1290,6 +1445,13 @@ lcore_rx_worker(void *arg)
     gap = MIN(worker_settings.stats_gap, worker_settings.batch_size);
 
     while(running.val) {
+
+        /* Paused on signal */
+        if (signal_pause) {
+            usleep(100);
+            continue;
+        }
+
         /* Get a batch of packets */
         packets = rx_receive_batch(&worker_settings,
                                    rte_mbufs);
@@ -1327,5 +1489,7 @@ lcore_rx_worker(void *arg)
     stats_fill_srcip_map(&worker_settings, &srcip_stats_local, false);
     map_destroy(&srcip_stats_local);
 
+    printf("RX worker %d exit \n", worker_settings.queue_index);
+    finalize_settings();
     return 0;
 }

@@ -2,6 +2,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <rte_byteorder.h>
 #include "trace-mapping.h"
 #include "packet.h"
@@ -49,7 +50,7 @@ struct trace_mapping {
     pthread_t *threads;
     int num_workers;
     uint64_t timestamp;
-    volatile int stop;
+    atomic_int stop;
 };
 
 /**
@@ -210,10 +211,12 @@ worker_start(void *args)
         vector_iterator_next(&it_timestamp);
     }
 
-    do {
+    while(!trace_mapping->stop) {
 
         ring = &trace_mapping->ring[idx];
-        while(ring->status == RING_ELEMENT_STATUS_FULL);
+        if (ring->status == RING_ELEMENT_STATUS_FULL) {
+            continue;
+        }
 
         timestamp = vector_iterator_valid(&it_timestamp) ? 
                     (long*)vector_iterator_get(&it_timestamp) : 
@@ -246,7 +249,7 @@ worker_start(void *args)
         }
         idx = (idx + trace_mapping->num_workers) % RING_SIZE;
 
-    } while(!trace_mapping->stop);
+    };
 
     free(worker_args);
     pthread_exit(NULL);
@@ -261,7 +264,7 @@ trace_mapping_destroy(struct trace_mapping *trace_mapping)
     }
 
     if (trace_mapping->threads) {
-        trace_mapping->stop = 1;
+        atomic_store(&trace_mapping->stop, 1);
         for (int i=0; i<trace_mapping->num_workers; i++) {
             pthread_join(trace_mapping->threads[i], NULL);
         }
@@ -304,7 +307,7 @@ trace_mapping_init(const char *locality_filename,
     trace_mapping->threads = malloc(sizeof(pthread_t)*num_workers);
     trace_mapping->num_workers = num_workers;
     trace_mapping->timestamp = 0;
-    trace_mapping->stop = 0;
+    atomic_init(&trace_mapping->stop, 0);
 
     if (!trace_mapping->threads) {
         trace_mapping_destroy(trace_mapping);
