@@ -10,7 +10,7 @@ sudo whoami
 if [[ ! -d libcommon/bin ]]; then
     echo "Building libcommon..."
     git submodule update --init
-    git -C libcommon checkout 10be038bf9c5a553f9d0ed241b5a3d8dd19306d9
+    git -C libcommon checkout c66358e243a0ab3981f5f83a83955df72a366d00
     make -C libcommon
 fi
 

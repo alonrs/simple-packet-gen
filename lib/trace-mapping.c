@@ -10,6 +10,7 @@
 #include "libcommon/lib/random.h"
 #include "libcommon/lib/vector.h"
 #include "libcommon/lib/map.h"
+#include "libcommon/lib/thread-sync.h"
 #include "libcommon/lib/perf.h"
 
 #define NUM_FIELDS  5
@@ -18,13 +19,16 @@
 #define RING_ELEMENT_STATUS_EMPTY 0
 #define RING_ELEMENT_STATUS_FULL 1
 
+#define SIGNAL_RUNNING 0
+#define SIGNAL_STOP 1
+#define SIGNAL_RESET 1
+
 struct packet {
     struct map_node node;
     struct ftuple ftuple;
     int priority;
     int locality;
 };
-
 
 struct uniform_locality_args {
     int num_of_packets;
@@ -44,13 +48,13 @@ ALIGNED_STRUCT(CACHE_LINE_SIZE, ring) {
 
 struct trace_mapping {
     struct ring ring[RING_SIZE];
+    struct thread_sync ts_signal;
     struct vector *locality;
     struct vector *timestamps;
     struct map *mapping;
     pthread_t *threads;
-    int num_workers;
     uint64_t timestamp;
-    atomic_int stop;
+    int num_workers;
     atomic_int speed_multiplier;
 };
 
@@ -198,12 +202,14 @@ worker_start(void *args)
     uint32_t hash;
     long *timestamp;
     long *locality;
+    int retval;
     int idx;
 
     worker_args = (struct worker_args*)args;
     trace_mapping = worker_args->trace_mapping;
 
     /* Init vector iterators to point to #element == "worker-num" */
+init_worker:
     it_locality = vector_begin(trace_mapping->locality);
     it_timestamp = vector_begin(trace_mapping->timestamps);
     idx = worker_args->current_worker;
@@ -212,7 +218,15 @@ worker_start(void *args)
         vector_iterator_next(&it_timestamp);
     }
 
-    while(!trace_mapping->stop) {
+    while(1) {
+
+        /* Parse signal */
+        retval = thread_sync_read_relaxed(&trace_mapping->ts_signal);
+        if (retval == SIGNAL_STOP) {
+            break;
+        } else if (retval == SIGNAL_RESET) {
+            goto init_worker;
+        }
 
         ring = &trace_mapping->ring[idx];
         if (ring->status == RING_ELEMENT_STATUS_FULL) {
@@ -266,7 +280,7 @@ trace_mapping_destroy(struct trace_mapping *trace_mapping)
     }
 
     if (trace_mapping->threads) {
-        atomic_store(&trace_mapping->stop, 1);
+        thread_sync_set_event(&trace_mapping->ts_signal, SIGNAL_STOP, 0);
         for (int i=0; i<trace_mapping->num_workers; i++) {
             pthread_join(trace_mapping->threads[i], NULL);
         }
@@ -310,7 +324,7 @@ trace_mapping_init(const char *mapping_filename,
     trace_mapping->num_workers = num_workers;
     trace_mapping->timestamp = 0;
     atomic_init(&trace_mapping->speed_multiplier, 1000);
-    atomic_init(&trace_mapping->stop, 0);
+    thread_sync_init(&trace_mapping->ts_signal);
 
     if (!trace_mapping->threads) {
         trace_mapping_destroy(trace_mapping);
@@ -380,13 +394,21 @@ trace_mapping_start(struct trace_mapping *trace_mapping)
         worker_args = xmalloc(sizeof(*worker_args));
         worker_args->current_worker = i;
         worker_args->trace_mapping = trace_mapping;
+        thread_sync_register(&trace_mapping->ts_signal);
         pthread_create(&trace_mapping->threads[i],
                        NULL,
                        worker_start,
                        worker_args);
     }
 
+    thread_sync_set_event(&trace_mapping->ts_signal, SIGNAL_RUNNING, 0);
     return 0;
+}
+
+void
+trace_mapping_reset(struct trace_mapping *trace_mapping)
+{
+    thread_sync_set_event(&trace_mapping->ts_signal, SIGNAL_RESET, 0);
 }
 
 int
@@ -398,10 +420,12 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
     struct ring *ring;
     uint64_t wait_until;
     uint64_t diff_ts;
+    int retval;
 
     ring = &trace_mapping->ring[*idx];
     while (ring->status == RING_ELEMENT_STATUS_EMPTY) {
-        if (trace_mapping->stop) {
+        retval = thread_sync_read_relaxed(&trace_mapping->ts_signal);
+        if (retval == SIGNAL_STOP) {
             return 1;
         }
     }
@@ -421,7 +445,8 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
 }
 
 void
-trace_mapping_set_multiplier(int value)
+trace_mapping_set_multiplier(struct trace_mapping *trace_mapping,
+                             int value)
 {
     atomic_store(&trace_mapping->speed_multiplier, value);
 }

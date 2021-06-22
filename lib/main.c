@@ -15,6 +15,7 @@
 #include "libcommon/lib/arguments.h"
 #include "libcommon/lib/vector.h"
 #include "libcommon/lib/map.h"
+#include "libcommon/lib/thread-sync.h"
 #include "config.h"
 #include "common.h"
 #include "packet.h"
@@ -197,7 +198,6 @@ static struct arguments app_args[] = {
 };
 
 /* Atomic messages accross cores, each a single cache line */
-MESSAGE_T(bool, running);
 MESSAGE_T(long, finalize);
 MESSAGE_T(bool, tx_running);
 MESSAGE_T(long, tx_counter);
@@ -227,11 +227,14 @@ static struct worker_settings worker_settings;
 static policy_t policy;
 
 /* Restore state after signal */
-atomic_long signal_pause;
-atomic_long signal_counter;
-atomic_long signal_ratelimiter;
-atomic_long signal_workers; 
-volatile bool signal_restart;
+struct thread_sync ts_signal;
+enum {
+    SIGNAL_RUNNING = 0,
+    SIGNAL_STOP = 1,
+    SIGNAL_PAUSE = 2,
+    SIGNAL_RESTART = 3,
+    SIGNAL_RATELIMITER = 4
+};
 
 /* Static method declaration */
 static void register_signals();
@@ -256,9 +259,8 @@ initialize_counters()
 static void
 initialize_signal_parameters()
 {
-    atomic_init(&signal_pause, 0);
-    atomic_init(&signal_restart, false);
-    atomic_init(&signal_ratelimiter, 0);
+    thread_sync_init(&ts_signal);
+    thread_sync_set_event(&ts_signal, SIGNAL_RUNNING, 0);
 }
 
 /* Force quit */
@@ -267,8 +269,7 @@ signal_sigterm(int signum)
 {
     printf("\n");
     fflush(stdout);
-    atomic_store(&signal_pause, 0);
-    atomic_store(&running.val, false);
+    thread_sync_set_event(&ts_signal, SIGNAL_STOP, 0);
 }
 
 /* Pause on SIGINT */
@@ -280,7 +281,7 @@ signal_sigint(int signum)
     char ans;
 
     signal(SIGINT, signal_sigterm);
-    atomic_store(&signal_pause, 1);
+    thread_sync_set_event(&ts_signal, SIGNAL_PAUSE, 0);
 
     ask_again:
     printf("%s", "\rWhat would you wish to do? "
@@ -291,9 +292,10 @@ signal_sigint(int signum)
 
     switch (ans) {
     case 'c':
+        thread_sync_set_event(&ts_signal, SIGNAL_RUNNING, 0);
         break;
     case 's':
-        atomic_store(&running.val, false);
+        thread_sync_set_event(&ts_signal, SIGNAL_STOP, 0);
         break;
     case 't':
         do {
@@ -301,21 +303,16 @@ signal_sigint(int signum)
             retval = scanf("%d", &rate);
         } while (retval != 1);
         initialize_counters();
-        atomic_store(&signal_restart, true);
-        atomic_store(&signal_ratelimiter, rate);
+        thread_sync_set_event(&ts_signal, SIGNAL_RATELIMITER, retval);
         break;
     case 'r':
         initialize_counters();
-        atomic_store(&signal_restart, true);
+        thread_sync_set_event(&ts_signal, SIGNAL_RESTART, 0);
         break;
     default:
         goto ask_again;
     }
 
-    /* "signal_counter" is like a semaphore for counting how many TX workers
-     * have received the signal messages */
-    atomic_store(&signal_counter, atomic_load(&signal_workers));
-    atomic_store(&signal_pause, 2);
     register_signals();
 }
 
@@ -894,10 +891,7 @@ main(int argc, char *argv[])
     map_init(&srcip_stats_map, MAP_INITIAL_SIZE);
 
     /* Initialize signal arguments */
-    atomic_init(&running.val, true);
     atomic_init(&finalize.val, 0);
-    atomic_init(&signal_counter, 0);
-    atomic_init(&signal_workers, 0);
     initialize_signal_parameters();
     
     /* Check that there is an even number of ports to send/receive on. */
@@ -1093,7 +1087,7 @@ tx_time_limit(const struct worker_settings *worker_settings,
     if (worker_settings->time_limit &&
         sec_counter >= worker_settings->time_limit) {
         printf("Time limit has reached. Stopping... \n");
-        atomic_store(&running.val, false);
+        thread_sync_set_event(&ts_signal, SIGNAL_STOP, 0);
     }
 
     if (worker_settings->tx_limit &&
@@ -1331,8 +1325,8 @@ lcore_tx_worker(void *arg)
     struct rte_mempool *rte_mempool;
     struct map srcip_stats_local;
     uint64_t pkt_counter;
-    bool updated_signal;
     uint16_t retval;
+    uint64_t code;
     int socket, core;
     int sec_counter;
     void *gen_state;
@@ -1343,7 +1337,6 @@ lcore_tx_worker(void *arg)
     sec_counter = 0;
     remaining_packets_to_send = 0;
     gen_state = NULL;
-    updated_signal = false;
 
     get_void_arg_bytes(&worker_settings,
                        arg,
@@ -1355,7 +1348,7 @@ lcore_tx_worker(void *arg)
                       worker_settings.batch_size,
                       worker_settings.tx_queue_num);
 
-    atomic_fetch_add(&signal_workers, 1);
+    thread_sync_register(&ts_signal);
 
     /* Packet limit is divided by the number of TX queues */
     worker_settings.packet_limit =
@@ -1370,39 +1363,31 @@ lcore_tx_worker(void *arg)
 
     map_init(&srcip_stats_local, MAP_INITIAL_SIZE);
 
-    while(running.val && tx_running.val) {
+    while(tx_running.val) {
 
-        /* Paused on signal */
-        if (signal_pause == 1) {
-            updated_signal = false;
+        /* Parse signals */
+        code = thread_sync_read_relaxed(&ts_signal);
+        if (code == SIGNAL_STOP) {
+            break;
+        } else if (code == SIGNAL_PAUSE) {
             usleep(100);
             continue;
-        } else if (signal_pause == 2 && updated_signal) {
-            usleep(100);
-            continue;
-        } else if (signal_pause == 2 && !updated_signal) {
-           worker_settings.tx_queue_num = atomic_load(&signal_workers);
-
-            /* Act according to signal parameters */
-            if (atomic_load(&signal_restart)) {
+        } else if (code != SIGNAL_RUNNING) {
+            retval = thread_sync_wait(&ts_signal, code);
+            if (retval != THREAD_SYNC_WAIT_LEADER) {
+                continue;
+            }
+            initialize_signal_parameters();
+            if (code == SIGNAL_RESTART) {
                 pkt_counter = 0;
                 remaining_packets_to_send = 0;
                 sec_counter = 0;
-            }
-            if (atomic_load(&signal_ratelimiter)) {
+            } else if (code == SIGNAL_RATELIMITER) {
+                retval = thread_sync_get_args(&ts_signal);
                 rate_limiter_init(&rate_limiter,
-                                  signal_ratelimiter,
+                                  retval,
                                   worker_settings.batch_size,
                                   worker_settings.tx_queue_num);
-            }
-
-            /* Wait for all other TX workers before resuming... */
-            retval = atomic_fetch_sub(&signal_counter, 1);
-            updated_signal = true;
-
-            /* Last worker resets the pause signal */
-            if (retval == 1) {
-                initialize_signal_parameters();
             }
             continue;
         }
@@ -1412,7 +1397,7 @@ lcore_tx_worker(void *arg)
                                         rte_mbufs,
                                         worker_settings.batch_size);
         if (retval) {
-            atomic_fetch_sub(&signal_workers, 1);
+            thread_sync_unregister(&ts_signal);
             printf("** RTE Error: failed to allocate mbuf on TX queue %d **\n",
                    worker_settings.queue_index);
             break;
@@ -1467,6 +1452,7 @@ lcore_rx_worker(void *arg)
     struct vector *latency_stats_local;
     int packets;
     int core;
+    int code;
     int gap;
 
     get_void_arg_bytes(&worker_settings,
@@ -1482,13 +1468,16 @@ lcore_rx_worker(void *arg)
 
     gap = MIN(worker_settings.stats_gap, worker_settings.batch_size);
 
-    while(running.val) {
+    while(1) {
 
-        /* Paused on signal */
-        if (signal_pause) {
-            usleep(100);
-            continue;
-        }
+        /* Parse signals */
+         code = thread_sync_read_relaxed(&ts_signal);
+         if (code == SIGNAL_STOP) {
+             break;
+         } else if (code == SIGNAL_PAUSE) {
+             usleep(100);
+             continue;
+         }
 
         /* Get a batch of packets */
         packets = rx_receive_batch(&worker_settings,

@@ -38,6 +38,11 @@ void trace_mapping_destroy(struct trace_mapping *trace_mapping);
 int trace_mapping_start(struct trace_mapping *trace_mapping);
 
 /**
+ * @brief Signal the trace mapping to reset
+ */
+void trace_mapping_reset(struct trace_mapping *trace_mapping);
+
+/**
  * @brief Returns the next trace packet. If the trace was loaded using a
  *  timestamp file, this method also waits the corresponding inter packet delay.
  * @param idx[in|out] The last index of the retrieved 5-tuple, 0 at the 
