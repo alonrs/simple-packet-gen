@@ -18,12 +18,12 @@ struct trace_mapping;
  * @returns NULL on error
  */
 struct trace_mapping*
-trace_mapping_init(const char *locality_filename,
-                   const char *mapping_filename,
+trace_mapping_init(const char *mapping_filename,
                    const char *timestamp_filename,
+                   const char *locality_filename,
+                   int num_workers,
                    uint32_t num_packets,
-                   uint32_t num_rules,
-                   int num_workers);
+                   uint32_t num_rules);
 
 
 /**
@@ -49,5 +49,13 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
                        struct ftuple *ftuple,
                        int *idx,
                        int txq);
+
+/**
+ * @brief Modify the speed multiplier for dynamic packet timestamping.
+ * @param value The new speed multiplier value; value=1000 stands for 1x
+ * speed multiplication; value=0 stands for constant speed.
+ */
+void trace_mapping_set_multiplier(struct trace_mapping *trace_mapping,
+                                  int value);
 
 #endif

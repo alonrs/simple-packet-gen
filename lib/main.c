@@ -166,11 +166,17 @@ static struct arguments app_args[] = {
                                  "controls the timestamp filename (optional). "
                                  "'file3' knob controls the locality filename "
                                  "(optional). 'n1' knob controls the number of "
-                                 "workers. If 'file3' knob is not set, "
-                                 "the mapping would have a uniform locality "
-                                 "with 'n2' knob to control the number of "
-                                 "packets, and 'n3' knob to control the number "
-                                 "of unique flows."},
+                                 "workers. If 'file3' knob is "
+                                 "not set, the mapping would have a uniform "
+                                 "locality with 'n2' knob to control the "
+                                 "number of packets, and 'n3' knob to control "
+                                 "the number of unique flows. 'n4' controls "
+                                 "whether to use adaptive speed ('n4'=1) or "
+                                 "constant speed ('n4'=0). In the adaptive "
+                                 "speed setting, the inter-packet delays loaded "
+                                 "from the 'timestamp' file would be doubled "
+                                 "whenever the drop rate > 1%, "
+                                 "otherwise they will be reduced by 1.5x."},
 
 /* Policy knobs */
 {"n1",             0, 0, "100",        "(Policy knob) 'n1' knob."},
@@ -328,8 +334,8 @@ parse_policy_knobs()
     struct policy_knobs policy_knobs;
     const char *str;
 
-    policy_knobs.n1 = ARG_DOUBLE(app_args, "n1", 100);
-    policy_knobs.n2 = ARG_DOUBLE(app_args, "n2", 500);
+    policy_knobs.n1 = ARG_DOUBLE(app_args, "n1", 3);
+    policy_knobs.n2 = ARG_DOUBLE(app_args, "n2", 5);
     policy_knobs.n3 = ARG_DOUBLE(app_args, "n3", 1);
     policy_knobs.n4 = ARG_DOUBLE(app_args, "n4", 1);
 
@@ -475,12 +481,16 @@ initialize_settings()
     case POLICY_MAPPING:
         printf("Using mapping policy.\n");
 
-        trace_mapping = trace_mapping_init(policy_knobs.file3,
-                                           policy_knobs.file1,
+        trace_mapping = trace_mapping_init(policy_knobs.file1,
                                            policy_knobs.file2,
+                                           policy_knobs.file3,
+                                           policy_knobs.n1,
                                            policy_knobs.n2,
-                                           policy_knobs.n3,
-                                           policy_knobs.n1);
+                                           policy_knobs.n3);
+        /* Disable adaptive speed setting */
+        if (policy_knobs.n4 == 0) {
+            trace_mapping_set_multiplier(trace_mapping, 0);
+        }
         trace_mapping_start(trace_mapping);
 
         policy_knobs.args = trace_mapping;
@@ -1222,6 +1232,32 @@ rx_free_memory(struct rte_mbuf **rte_mbufs,
     }
 }
 
+/* Sets the adaptive speed for mapping policy with adaptive speed */
+static void
+adaptive_speed_multiplier(const int core,
+                          const struct worker_settings *worker_settings,
+                          const double drop_percent)
+{
+    static int multiplier = 1000;
+    struct policy_knobs *knobs;
+    struct trace_mapping *trace_mapping;
+
+    knobs = (struct policy_knobs*)worker_settings->args;
+    trace_mapping = (struct trace_mapping*)knobs->args;
+
+    if (policy != POLICY_MAPPING) {
+        return;
+    }
+
+    if ((drop_percent > 1) && (multiplier < 20000)) {
+        multiplier *= 2;
+    } else if (multiplier > 3) {
+        multiplier = multiplier / 1.5;
+    }
+
+    trace_mapping_set_multiplier(trace_mapping, multiplier);
+}
+
 /* Prints RX counter to stdout, only from the RX leader core */
 static void
 rx_show_counter(const int core,
@@ -1260,9 +1296,11 @@ rx_show_counter(const int core,
     mpps = (double)counter/1e6/diff_ns;
     err_counter = atomic_exchange(&rx_err_counter.val, 0);
 
+    /* Calculate drop percent, set adaptive speed settings */
     drop_tx_cnt = atomic_exchange(&drop_tx_counter.val, 0);
     drop_rx_cnt = atomic_exchange(&drop_rx_counter.val, 0);
     drop_percent = (1.0 - (double)drop_rx_cnt / drop_tx_cnt) * 100;
+    adaptive_speed_multiplier(core, worker_settings, drop_percent);
 
     /* Calc avg latency */
     rte_spinlock_lock(&latency_lock);

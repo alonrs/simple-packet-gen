@@ -51,6 +51,7 @@ struct trace_mapping {
     int num_workers;
     uint64_t timestamp;
     atomic_int stop;
+    atomic_int speed_multiplier;
 };
 
 /**
@@ -239,7 +240,8 @@ worker_start(void *args)
         }
 
         /* Set additional values, timestamp in nanosec */
-        ring->timestamp = timestamp ? *timestamp * 1000 : 0;
+        ring->timestamp = trace_mapping->speed_multiplier *
+                          (timestamp ? *timestamp : 0);
         ring->status = RING_ELEMENT_STATUS_FULL;
 
         /* Continue to the next packet */
@@ -283,12 +285,12 @@ trace_mapping_destroy(struct trace_mapping *trace_mapping)
 }
 
 struct trace_mapping*
-trace_mapping_init(const char *locality_filename,
-                   const char *mapping_filename,
+trace_mapping_init(const char *mapping_filename,
                    const char *timestamp_filename,
+                   const char *locality_filename,
+                   int num_workers,
                    uint32_t num_packets,
-                   uint32_t num_rules,
-                   int num_workers)
+                   uint32_t num_rules)
 {
     struct uniform_locality_args args;
     struct trace_mapping *trace_mapping;
@@ -307,6 +309,7 @@ trace_mapping_init(const char *locality_filename,
     trace_mapping->threads = malloc(sizeof(pthread_t)*num_workers);
     trace_mapping->num_workers = num_workers;
     trace_mapping->timestamp = 0;
+    atomic_init(&trace_mapping->speed_multiplier, 1000);
     atomic_init(&trace_mapping->stop, 0);
 
     if (!trace_mapping->threads) {
@@ -393,12 +396,10 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
                        int txq)
 {
     struct ring *ring;
-    struct ring *last;
     uint64_t wait_until;
     uint64_t diff_ts;
 
     ring = &trace_mapping->ring[*idx];
-    last = &trace_mapping->ring[(*idx - txq) % RING_SIZE];
     while (ring->status == RING_ELEMENT_STATUS_EMPTY) {
         if (trace_mapping->stop) {
             return 1;
@@ -406,7 +407,7 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
     }
 
     /* Inter packet delays are in micro second */
-    diff_ts = last->timestamp == 0 ? 0 : ring->timestamp - last->timestamp;
+    diff_ts = ring->timestamp;
     wait_until = trace_mapping->timestamp + diff_ts;
     while (get_time_ns() < wait_until);
 
@@ -417,5 +418,11 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
     *idx = (*idx+txq) % RING_SIZE;
 
     return 0;
+}
+
+void
+trace_mapping_set_multiplier(int value)
+{
+    atomic_store(&trace_mapping->speed_multiplier, value);
 }
 
