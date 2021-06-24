@@ -21,7 +21,7 @@
 
 #define SIGNAL_RUNNING 0
 #define SIGNAL_STOP 1
-#define SIGNAL_RESET 1
+#define SIGNAL_RESET 2
 
 struct packet {
     struct map_node node;
@@ -190,6 +190,23 @@ generate_uniform_locality(void* args)
     return vector;
 }
 
+static void
+trace_mapping_clear(struct trace_mapping *trace_mapping)
+{
+    int adaptive;
+
+    trace_mapping->timestamp = 0;
+    adaptive = atomic_load(&trace_mapping->speed_multiplier) != 0;
+    if (adaptive) {
+        atomic_init(&trace_mapping->speed_multiplier, 1000);
+    }
+
+    for (int i=0; i<RING_SIZE; i++) {
+        atomic_store(&trace_mapping->ring[i].status,
+                     RING_ELEMENT_STATUS_EMPTY);
+    }
+}
+
 static void*
 worker_start(void *args)
 {
@@ -199,14 +216,15 @@ worker_start(void *args)
     struct vector_iterator it_timestamp;
     struct packet *packet;
     struct ring *ring;
+    uint64_t retval;
     uint32_t hash;
     long *timestamp;
     long *locality;
-    int retval;
     int idx;
 
     worker_args = (struct worker_args*)args;
     trace_mapping = worker_args->trace_mapping;
+    thread_sync_register(&trace_mapping->ts_signal);
 
     /* Init vector iterators to point to #element == "worker-num" */
 init_worker:
@@ -221,10 +239,20 @@ init_worker:
     while(1) {
 
         /* Parse signal */
-        retval = thread_sync_read_relaxed(&trace_mapping->ts_signal);
+        thread_sync_read_relaxed(&trace_mapping->ts_signal, &retval, NULL);
         if (retval == SIGNAL_STOP) {
             break;
         } else if (retval == SIGNAL_RESET) {
+            /* Sync with all workers */
+            retval = thread_sync_full_barrier(&trace_mapping->ts_signal);
+            if (retval == THREAD_SYNC_WAIT_LEADER) {
+                thread_sync_set_event(&trace_mapping->ts_signal,
+                                      SIGNAL_RUNNING,
+                                      0);
+                thread_sync_continue(&trace_mapping->ts_signal);
+            }
+            /* Reset */
+            trace_mapping_clear(trace_mapping);
             goto init_worker;
         }
 
@@ -240,9 +268,10 @@ init_worker:
                    (long*)vector_iterator_get(&it_locality) :
                    NULL;
 
-        /* Got to the end of the mapping, stop */
+        /* Got to the end of the mapping, pause */
         if (!locality) {
-            break;
+            usleep(100);
+            continue;
         }
 
         /* Point to the relevant 5-tuple */
@@ -267,6 +296,7 @@ init_worker:
 
     };
 
+    thread_sync_unregister(&trace_mapping->ts_signal);
     free(worker_args);
     pthread_exit(NULL);
 }
@@ -319,12 +349,10 @@ trace_mapping_init(const char *mapping_filename,
     memset(trace_mapping, 0, sizeof(*trace_mapping));
     bitmask = 0;
 
-
     trace_mapping->threads = malloc(sizeof(pthread_t)*num_workers);
     trace_mapping->num_workers = num_workers;
-    trace_mapping->timestamp = 0;
-    atomic_init(&trace_mapping->speed_multiplier, 1000);
     thread_sync_init(&trace_mapping->ts_signal);
+    trace_mapping_clear(trace_mapping);
 
     if (!trace_mapping->threads) {
         trace_mapping_destroy(trace_mapping);
@@ -394,7 +422,6 @@ trace_mapping_start(struct trace_mapping *trace_mapping)
         worker_args = xmalloc(sizeof(*worker_args));
         worker_args->current_worker = i;
         worker_args->trace_mapping = trace_mapping;
-        thread_sync_register(&trace_mapping->ts_signal);
         pthread_create(&trace_mapping->threads[i],
                        NULL,
                        worker_start,
@@ -420,20 +447,18 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
     struct ring *ring;
     uint64_t wait_until;
     uint64_t diff_ts;
-    int retval;
 
     ring = &trace_mapping->ring[*idx];
-    while (ring->status == RING_ELEMENT_STATUS_EMPTY) {
-        retval = thread_sync_read_relaxed(&trace_mapping->ts_signal);
-        if (retval == SIGNAL_STOP) {
-            return 1;
-        }
+    if (ring->status == RING_ELEMENT_STATUS_EMPTY) {
+        return TRACE_MAPPING_TRY_AGAIN;
     }
 
     /* Inter packet delays are in micro second */
     diff_ts = ring->timestamp;
     wait_until = trace_mapping->timestamp + diff_ts;
-    while (get_time_ns() < wait_until);
+    if (get_time_ns() < wait_until) {
+        return TRACE_MAPPING_TRY_AGAIN;
+    }
 
     trace_mapping->timestamp = get_time_ns();
     ring->status = RING_ELEMENT_STATUS_EMPTY;
@@ -441,7 +466,7 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
     *ftuple = ring->ftuple;
     *idx = (*idx+txq) % RING_SIZE;
 
-    return 0;
+    return TRACE_MAPPING_VALID;
 }
 
 void
@@ -449,5 +474,11 @@ trace_mapping_set_multiplier(struct trace_mapping *trace_mapping,
                              int value)
 {
     atomic_store(&trace_mapping->speed_multiplier, value);
+}
+
+int
+trace_mapping_get_multiplier(struct trace_mapping *trace_mapping)
+{
+    return atomic_load(&trace_mapping->speed_multiplier);
 }
 

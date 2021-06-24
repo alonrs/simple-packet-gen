@@ -5,6 +5,12 @@
 
 struct trace_mapping;
 
+/* Trace mapping status codes */
+enum {
+    TRACE_MAPPING_VALID = 0,
+    TRACE_MAPPING_TRY_AGAIN
+};
+
 /**
  * @brief Loads mapping from files, initiate data-structure
  * @param locality_filename If NULL, will generate a uniform locality
@@ -44,10 +50,11 @@ void trace_mapping_reset(struct trace_mapping *trace_mapping);
 
 /**
  * @brief Returns the next trace packet. If the trace was loaded using a
- *  timestamp file, this method also waits the corresponding inter packet delay.
+ * timestamp file, this method also waits the corresponding inter packet delay.
  * @param idx[in|out] The last index of the retrieved 5-tuple, 0 at the 
  * beginning. Should be unique per TX queue
  * @param txq Number of TX queues
+ * @returns One of the trace-mapping status codes.
  */
 int
 trace_mapping_get_next(struct trace_mapping *trace_mapping,
@@ -62,5 +69,7 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
  */
 void trace_mapping_set_multiplier(struct trace_mapping *trace_mapping,
                                   int value);
+
+int trace_mapping_get_multiplier(struct trace_mapping *trace_mapping);
 
 #endif

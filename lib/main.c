@@ -35,10 +35,10 @@ enum { MAX_EAL_ARGS = 64 };
 
 /* Passed to worker threads */
 struct worker_settings {
-    generator_policy_func_t generator; /* Packet generator */
-    generator_mode_t generator_mode;   /* RAW or 5-tuples */
-    double rate_limit;                 /* Zero stands for no limit */
-    void *args;                        /* Generator custom arguments */
+    generator_policy_func_t generator;      /* Packet generator */
+    generator_mode_t generator_mode;        /* RAW or 5-tuples */
+    double rate_limit;                      /* Zero stands for no limit */
+    struct generator_state generator_state; /* Generator state */
     uint64_t packet_limit;             /* Zero stands for no limit */
     int time_limit;                    /* Zero stands for no limit */
     int tx_limit;                      /* Zero stands for no limit */
@@ -180,8 +180,8 @@ static struct arguments app_args[] = {
                                  "otherwise they will be reduced by 1.5x."},
 
 /* Policy knobs */
-{"n1",             0, 0, "100",        "(Policy knob) 'n1' knob."},
-{"n2",             0, 0, "500",        "(Policy knob) 'n2' knob."},
+{"n1",             0, 0, "3",          "(Policy knob) 'n1' knob."},
+{"n2",             0, 0, "5",          "(Policy knob) 'n2' knob."},
 {"n3",             0, 0, "1",          "(Policy knob) 'n3' knob."},
 {"n4",             0, 0, "1",          "(Policy knob) 'n4' knob."},
 {"5tuple",         0, 0, FTUPLE_DEF_1, "(Policy knob) '5tuple' knob."},
@@ -198,7 +198,6 @@ static struct arguments app_args[] = {
 };
 
 /* Atomic messages accross cores, each a single cache line */
-MESSAGE_T(long, finalize);
 MESSAGE_T(bool, tx_running);
 MESSAGE_T(long, tx_counter);
 MESSAGE_T(long, rx_counter);
@@ -229,11 +228,12 @@ static policy_t policy;
 /* Restore state after signal */
 struct thread_sync ts_signal;
 enum {
-    SIGNAL_RUNNING = 0,
-    SIGNAL_STOP = 1,
-    SIGNAL_PAUSE = 2,
-    SIGNAL_RESTART = 3,
-    SIGNAL_RATELIMITER = 4
+    SIGNAL_RUNNING     = 0,
+    SIGNAL_STOP        = 1,
+    SIGNAL_PAUSE       = 2,
+    SIGNAL_RESTART     = 4,
+    SIGNAL_RATELIMITER = 8,
+    SIGNAL_MULTIPLIER  = 16
 };
 
 /* Static method declaration */
@@ -284,9 +284,14 @@ signal_sigint(int signum)
     thread_sync_set_event(&ts_signal, SIGNAL_PAUSE, 0);
 
     ask_again:
-    printf("%s", "\rWhat would you wish to do? "
-         "Continue [C]; Stop [S]; Reset with rate limiter [T]; "
-         "Restart [R] : ");
+    printf("\rWhat would you wish to do? "
+           "Continue [C]; Stop [S]; Reset with rate limiter [T]; "
+           "Restart [R]");
+    if (policy == POLICY_MAPPING) {
+         printf("; Set adaptive rate multiplier (0 disables adaptive) [A]");
+    }
+    printf(" :");
+
     ans = getchar();
     ans = tolower(ans);
 
@@ -303,7 +308,19 @@ signal_sigint(int signum)
             retval = scanf("%d", &rate);
         } while (retval != 1);
         initialize_counters();
-        thread_sync_set_event(&ts_signal, SIGNAL_RATELIMITER, retval);
+        thread_sync_set_event(&ts_signal,
+                              SIGNAL_RESTART | SIGNAL_RATELIMITER,
+                              rate);
+        break;
+    case 'a':
+        do {
+            printf("%s", "Enter manual adaptive rate to start from: ");
+            retval = scanf("%d", &rate);
+        } while (retval != 1);
+        initialize_counters();
+        thread_sync_set_event(&ts_signal,
+                              SIGNAL_RESTART | SIGNAL_MULTIPLIER,
+                              rate);
         break;
     case 'r':
         initialize_counters();
@@ -507,8 +524,9 @@ initialize_settings()
         break;
     }
 
-    worker_settings.args = alloc_void_arg_bytes(&policy_knobs,
-                                                sizeof(policy_knobs));
+    memcpy(&worker_settings.generator_state.knobs,
+           &policy_knobs,
+           sizeof(policy_knobs));
 }
 
 /* Close objects related to arguments */
@@ -516,12 +534,7 @@ static void
 finalize_settings()
 {
     struct policy_knobs *knobs;
-    knobs = (struct policy_knobs*)worker_settings.args;
-
-    /* Perform operation only once */
-    if (atomic_fetch_add(&finalize.val, 1)) {
-        return;
-    }
+    knobs = &worker_settings.generator_state.knobs;
 
     switch (policy) {
     case POLICY_MAPPING:
@@ -891,7 +904,6 @@ main(int argc, char *argv[])
     map_init(&srcip_stats_map, MAP_INITIAL_SIZE);
 
     /* Initialize signal arguments */
-    atomic_init(&finalize.val, 0);
     initialize_signal_parameters();
     
     /* Check that there is an even number of ports to send/receive on. */
@@ -927,37 +939,68 @@ main(int argc, char *argv[])
     save_ftuple_statistics_file();
     save_srcip_statistics_file();
 
+    finalize_settings();
+    return 0;
+}
+
+/* Create a new array of "mbufs" to send */
+static inline int
+tx_allocate_mbufs(struct rte_mempool *rte_mempool,
+                  struct rte_mbuf **rte_mbufs,
+                  struct worker_settings *worker_settings,
+                  uint16_t *num_of_free_mbufs,
+                  uint64_t *packet_counter)
+{
+    int retval;
+
+    /* Don't allocate mbufs as long as the last batch still valid */
+    if (*num_of_free_mbufs) {
+        return 0;
+    }
+
+    retval = rte_pktmbuf_alloc_bulk(rte_mempool,
+                                    rte_mbufs,
+                                    worker_settings->batch_size);
+    if (retval) {
+        return 1;
+    }
+
+    *num_of_free_mbufs = worker_settings->batch_size;
     return 0;
 }
 
 /* Generate a packet batch acording to "worker_settings", fill "rte_mbufs".
  * The generator state "gen_state" is both read and updated.
  * Method is inline for compiler optimizations with "batch_size" */
-static inline int
+static inline void
 tx_generate_batch(struct rte_mbuf **rte_mbufs,
                   struct worker_settings *worker_settings,
-                  void **gen_state,
-                  uint64_t *packet_counter,
-                  const int batch_size)
+                  uint16_t *remaining_packets,
+                  uint64_t *packet_counter)
 {
     void *gen_data;
-
-    /* Initiate state */
-    if (!*packet_counter) {
-        *gen_state = worker_settings->args;
+    int num;
+    int i;
+    
+    /* Don't generate new packets as long as the last batch still valid */
+    if (*remaining_packets) {
+        return;
     }
 
+    num = worker_settings->batch_size;
+
     /* Generate packet batch based on the 5-tuple */
-    for (int i=0; i<batch_size; i++) {
-        *gen_state = worker_settings->generator(*packet_counter,
-                                                worker_settings->queue_index,
-                                                worker_settings->tx_queue_num,
-                                                *gen_state,
-                                                &gen_data);
+    for (i=0; i<num; i++) {
+        worker_settings->generator(*packet_counter,
+                                   worker_settings->queue_index,
+                                   worker_settings->tx_queue_num,
+                                   &worker_settings->generator_state,
+                                   &gen_data);
 
         /* No further packets available */
-        if (!gen_data) {
-            return i;
+        if ((!gen_data) ||
+            (worker_settings->generator_state.status == GENERATOR_TRY_AGAIN)) {
+            break;
         }
 
         /* Fill "rte_mbufs[i]" with data according to the generator mode */
@@ -979,7 +1022,7 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
         (*packet_counter)++;
     }
 
-    return batch_size;
+    *remaining_packets = i;
 }
 
 /* Sends "batch_size" packet from "rte_mbufs" according to "worker_settings".
@@ -1228,20 +1271,21 @@ rx_free_memory(struct rte_mbuf **rte_mbufs,
 
 /* Sets the adaptive speed for mapping policy with adaptive speed */
 static void
-adaptive_speed_multiplier(const int core,
-                          const struct worker_settings *worker_settings,
+adaptive_speed_multiplier(const struct worker_settings *worker_settings,
                           const double drop_percent)
 {
-    static int multiplier = 1000;
-    struct policy_knobs *knobs;
+    const struct policy_knobs *knobs;
     struct trace_mapping *trace_mapping;
+    int multiplier;
 
-    knobs = (struct policy_knobs*)worker_settings->args;
+    knobs = &worker_settings->generator_state.knobs;
     trace_mapping = (struct trace_mapping*)knobs->args;
 
     if (policy != POLICY_MAPPING) {
         return;
     }
+
+    multiplier = trace_mapping_get_multiplier(trace_mapping);
 
     if ((drop_percent > 1) && (multiplier < 20000)) {
         multiplier *= 2;
@@ -1250,6 +1294,38 @@ adaptive_speed_multiplier(const int core,
     }
 
     trace_mapping_set_multiplier(trace_mapping, multiplier);
+}
+
+static void
+adaptive_speed_set(int value)
+{
+    const struct policy_knobs *knobs;
+    struct trace_mapping *trace_mapping;
+
+    knobs = &worker_settings.generator_state.knobs;
+    trace_mapping = (struct trace_mapping*)knobs->args;
+
+    if (policy != POLICY_MAPPING) {
+        return;
+    }
+
+    trace_mapping_set_multiplier(trace_mapping, value);
+}
+
+/* Resets configuration relavent to the packet generator */
+static void
+reset_packet_generator(const struct worker_settings *worker_settings)
+{
+    const struct policy_knobs *knobs;
+    struct trace_mapping *trace_mapping;
+
+    knobs = &worker_settings->generator_state.knobs;
+    trace_mapping = (struct trace_mapping*)knobs->args;
+
+    if (policy == POLICY_MAPPING) {
+        trace_mapping_reset(trace_mapping);
+    }
+
 }
 
 /* Prints RX counter to stdout, only from the RX leader core */
@@ -1294,7 +1370,7 @@ rx_show_counter(const int core,
     drop_tx_cnt = atomic_exchange(&drop_tx_counter.val, 0);
     drop_rx_cnt = atomic_exchange(&drop_rx_counter.val, 0);
     drop_percent = (1.0 - (double)drop_rx_cnt / drop_tx_cnt) * 100;
-    adaptive_speed_multiplier(core, worker_settings, drop_percent);
+    adaptive_speed_multiplier(worker_settings, drop_percent);
 
     /* Calc avg latency */
     rte_spinlock_lock(&latency_lock);
@@ -1318,25 +1394,26 @@ rx_show_counter(const int core,
 static int
 lcore_tx_worker(void *arg)
 {
-    struct worker_settings worker_settings;
     struct rte_mbuf *rte_mbufs[MAX_BATCH_SIZE];
+    struct worker_settings worker_settings;
     uint16_t remaining_packets_to_send;
+    uint16_t num_of_free_mbufs;
     struct rate_limiter rate_limiter;
     struct rte_mempool *rte_mempool;
     struct map srcip_stats_local;
     uint64_t pkt_counter;
-    uint16_t retval;
+    uint64_t retval;
     uint64_t code;
+    uint64_t args;
     int socket, core;
     int sec_counter;
-    void *gen_state;
 
     socket = rte_socket_id();
     core = rte_lcore_id();
     pkt_counter = 0;
     sec_counter = 0;
     remaining_packets_to_send = 0;
-    gen_state = NULL;
+    num_of_free_mbufs = 0;
 
     get_void_arg_bytes(&worker_settings,
                        arg,
@@ -1366,58 +1443,66 @@ lcore_tx_worker(void *arg)
     while(tx_running.val) {
 
         /* Parse signals */
-        code = thread_sync_read_relaxed(&ts_signal);
+        thread_sync_read_relaxed(&ts_signal, &code, &args);
         if (code == SIGNAL_STOP) {
             break;
         } else if (code == SIGNAL_PAUSE) {
             usleep(100);
             continue;
         } else if (code != SIGNAL_RUNNING) {
-            retval = thread_sync_wait(&ts_signal, code);
-            if (retval != THREAD_SYNC_WAIT_LEADER) {
-                continue;
-            }
-            initialize_signal_parameters();
-            if (code == SIGNAL_RESTART) {
+            /* Sync with all threads */
+            retval = thread_sync_full_barrier(&ts_signal);
+            /* Act according to code */
+            if (code & SIGNAL_RESTART) {
                 pkt_counter = 0;
                 remaining_packets_to_send = 0;
                 sec_counter = 0;
-            } else if (code == SIGNAL_RATELIMITER) {
-                retval = thread_sync_get_args(&ts_signal);
+                /* The leader resets the packet generator */
+                if (retval == THREAD_SYNC_WAIT_LEADER) {
+                    reset_packet_generator(&worker_settings);
+                }
+            }
+            if (code & SIGNAL_RATELIMITER) {
                 rate_limiter_init(&rate_limiter,
-                                  retval,
+                                  args,
                                   worker_settings.batch_size,
                                   worker_settings.tx_queue_num);
             }
-            continue;
+            if (code & SIGNAL_MULTIPLIER) {
+                adaptive_speed_set(args);
+            }
+            /* Release all other threads */
+            if (retval == THREAD_SYNC_WAIT_LEADER) {
+                thread_sync_set_event(&ts_signal, SIGNAL_RUNNING, 0);
+                thread_sync_continue(&ts_signal);
+            }
         }
 
-        /* Allocate mbufs for current batch */
-        retval = rte_pktmbuf_alloc_bulk(rte_mempool,
-                                        rte_mbufs,
-                                        worker_settings.batch_size);
+        /* Allocate mbufs */
+        retval = tx_allocate_mbufs(rte_mempool,
+                                   rte_mbufs,
+                                   &worker_settings,
+                                   &num_of_free_mbufs,
+                                   &pkt_counter);
         if (retval) {
-            thread_sync_unregister(&ts_signal);
-            printf("** RTE Error: failed to allocate mbuf on TX queue %d **\n",
+            printf("** RTE Error: failed to allocate mbuf "
+                   "on TX queue %d **\n",
                    worker_settings.queue_index);
-            break;
         }
 
-        /* Don't generate a new batch untill all previous packets were sent */
-        if (!remaining_packets_to_send) {
-            remaining_packets_to_send = 
-                tx_generate_batch(rte_mbufs,
-                                  &worker_settings,
-                                  &gen_state,
-                                  &pkt_counter,
-                                  worker_settings.batch_size);
-        }
+        /* Fill packets in batch */
+        tx_generate_batch(rte_mbufs,
+                          &worker_settings,
+                          &remaining_packets_to_send,
+                          &pkt_counter);
 
         retval = tx_send_batch(rte_mbufs,
                                &worker_settings,
                                &srcip_stats_local,
                                remaining_packets_to_send);
+        
         remaining_packets_to_send -= retval;
+        num_of_free_mbufs -= retval;
 
         tx_show_counter(socket,
                         core,
@@ -1435,9 +1520,10 @@ lcore_tx_worker(void *arg)
     /* Push values from local map into global map */
     stats_fill_srcip_map(&worker_settings, &srcip_stats_local, true);
     map_destroy(&srcip_stats_local);
-    printf("TX worker %d exit \n", worker_settings.queue_index);
-    finalize_settings();
+    thread_sync_unregister(&ts_signal);
 
+    printf("TX worker %d exit \n", worker_settings.queue_index);
+    
     return 0;
 }
 
@@ -1450,9 +1536,9 @@ lcore_rx_worker(void *arg)
     struct map ftuple_stats_local;
     struct map srcip_stats_local;
     struct vector *latency_stats_local;
+    uint64_t code;
     int packets;
     int core;
-    int code;
     int gap;
 
     get_void_arg_bytes(&worker_settings,
@@ -1471,7 +1557,7 @@ lcore_rx_worker(void *arg)
     while(1) {
 
         /* Parse signals */
-         code = thread_sync_read_relaxed(&ts_signal);
+         thread_sync_read_relaxed(&ts_signal, &code, NULL);
          if (code == SIGNAL_STOP) {
              break;
          } else if (code == SIGNAL_PAUSE) {
@@ -1517,6 +1603,5 @@ lcore_rx_worker(void *arg)
     map_destroy(&srcip_stats_local);
 
     printf("RX worker %d exit \n", worker_settings.queue_index);
-    finalize_settings();
     return 0;
 }

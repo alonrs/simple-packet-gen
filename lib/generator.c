@@ -17,16 +17,15 @@ struct pcap_state {
     struct raw_packet raw;
 };
 
-void*
+void
 generator_policy_superspreader(uint64_t pkt_num,
                                uint16_t queue_idx,
                                uint16_t queue_total,
-                               void *args,
+                               struct generator_state *generator_state,
                                void **out)
 {
     /* Thread specfic state */
     struct {
-        struct policy_knobs knobs;
         uint64_t phase_counter;        /* Counter packets for phase */
         uint64_t packets_per_phase;    /* Number of packets per phase */
         uint32_t src_ip;
@@ -42,14 +41,10 @@ generator_policy_superspreader(uint64_t pkt_num,
     if (!pkt_num) {
         /* Memory allocation per core, initialize values */
         state = xmalloc(sizeof(*state));
-        get_void_arg_bytes(&state->knobs,
-                           args,
-                           sizeof(struct policy_knobs),
-                           false);
-        state->src_ip = rte_be_to_cpu_32(state->knobs.ftuple1.src_ip);
-        state->dst_ip = rte_be_to_cpu_32(state->knobs.ftuple1.dst_ip);
-        state->packets_per_phase = state->knobs.n4;
-        state->phase_srcip_num = state->knobs.n3 * queue_total;
+        state->src_ip = rte_be_to_cpu_32(generator_state->knobs.ftuple1.src_ip);
+        state->dst_ip = rte_be_to_cpu_32(generator_state->knobs.ftuple1.dst_ip);
+        state->packets_per_phase = generator_state->knobs.n4;
+        state->phase_srcip_num = generator_state->knobs.n3 * queue_total;
         state->src_counter = queue_idx;
         state->dst_counter = 0;
         state->phase_src_start = 0;
@@ -58,7 +53,7 @@ generator_policy_superspreader(uint64_t pkt_num,
     }
     /* Get state from args */
     else {
-        state = args;
+        state = generator_state->args;
     }
 
     if (state->src_counter >= state->phase_src_end) {
@@ -66,14 +61,14 @@ generator_policy_superspreader(uint64_t pkt_num,
         state->dst_counter++;
     }
 
-    if (state->dst_counter >= state->knobs.n2) {
+    if (state->dst_counter >= generator_state->knobs.n2) {
         state->dst_counter = 0;
     }
 
     /* Update 5-tuple values */
-    state->knobs.ftuple1.src_ip =
+    generator_state->knobs.ftuple1.src_ip =
             rte_cpu_to_be_32(state->src_ip + state->src_counter * 0x010000);
-    state->knobs.ftuple1.dst_ip =
+    generator_state->knobs.ftuple1.dst_ip =
             rte_cpu_to_be_32(state->src_ip + state->src_counter * 0x010000 + 
                              state->dst_counter);
 
@@ -86,32 +81,32 @@ generator_policy_superspreader(uint64_t pkt_num,
         state->phase_counter = 0;
         state->phase_src_start += state->phase_srcip_num;
         state->phase_src_end += state->phase_srcip_num;
-        if (state->phase_src_start >= state->knobs.n1) {
+        if (state->phase_src_start >= generator_state->knobs.n1) {
             state->phase_src_start = 0;
             state->phase_src_end = state->phase_srcip_num;
         }
-        if (state->phase_src_end >= state->knobs.n1) {
-            state->phase_src_end = state->knobs.n1;
+        if (state->phase_src_end >= generator_state->knobs.n1) {
+            state->phase_src_end = generator_state->knobs.n1;
         }
         state->src_counter = state->phase_src_start + queue_idx; 
     }
 
     /* Output is a pointer to the 5-tuple */
-    *out = &state->knobs.ftuple1;
+    *out = &generator_state->knobs.ftuple1;
 
-    return state;
+    generator_state->args = state;
+    generator_state->status = GENERATOR_VALID;
 }
 
-void*
+void
 generator_policy_nflows(uint64_t pkt_num,
                         uint16_t queue_idx,
                         uint16_t queue_total,
-                        void *args,
+                        struct generator_state *generator_state,
                         void **out)
 {
     /* Thread specfic state */
     struct {
-        struct policy_knobs knobs;
         uint32_t src_ip;
         uint32_t dst_ip;
         int counter;
@@ -121,50 +116,46 @@ generator_policy_nflows(uint64_t pkt_num,
     if (!pkt_num) {
         /* Memory allocation per core, initialize values */
         state = xmalloc(sizeof(*state));
-        get_void_arg_bytes(&state->knobs,
-                           args,
-                           sizeof(struct policy_knobs),
-                           false);
-        state->src_ip = rte_be_to_cpu_32(state->knobs.ftuple1.src_ip);
-        state->dst_ip = rte_be_to_cpu_16(state->knobs.ftuple1.dst_ip);
+        state->src_ip = rte_be_to_cpu_32(generator_state->knobs.ftuple1.src_ip);
+        state->dst_ip = rte_be_to_cpu_16(generator_state->knobs.ftuple1.dst_ip);
         state->counter = 0;
     }
     /* Get state from args */
     else {
-        state = args;
+        state = generator_state->args;
     }
 
-    if (state->counter == state->knobs.n1) {
+    if (state->counter == generator_state->knobs.n1) {
         state->counter = 0;
     }
 
     /* Update 5-tuple values */
-    state->knobs.ftuple1.src_ip =
+    generator_state->knobs.ftuple1.src_ip =
             rte_cpu_to_be_32(state->src_ip + state->counter);
-    state->knobs.ftuple1.dst_ip =
+    generator_state->knobs.ftuple1.dst_ip =
             rte_cpu_to_be_32(state->dst_ip + state->counter);
 
     /* Update counter with probability "n2" */
-    if (random_coin(state->knobs.n2)) {
+    if (random_coin(generator_state->knobs.n2)) {
         state->counter++;
     }
 
     /* Output is a pointer to the 5-tuple */
-    *out = &state->knobs.ftuple1;
+    *out = &generator_state->knobs.ftuple1;
 
-    return state;
+    generator_state->args = state;
+    generator_state->status = GENERATOR_VALID;
 }
 
-void*
+void
 generator_policy_paths(uint64_t pkt_num,
                        uint16_t queue_idx,
                        uint16_t queue_total,
-                       void *args,
+                       struct generator_state *generator_state,
                        void **out)
 {
     /* Thread specfic state */
     struct {
-        struct policy_knobs knobs;
         uint32_t ip;
         int counter;
         uint64_t timestamp;
@@ -176,55 +167,52 @@ generator_policy_paths(uint64_t pkt_num,
     if (!pkt_num) {
         /* Memory allocation per core, initialize values */
         state = xmalloc(sizeof(*state));
-        get_void_arg_bytes(&state->knobs,
-                           args,
-                           sizeof(struct policy_knobs),
-                           false);
-        state->knobs.n3 *= 1e6; /* From us to ns */
-        state->ip = rte_be_to_cpu_32(state->knobs.ftuple1.src_ip);
+        generator_state->knobs.n3 *= 1e6; /* From us to ns */
+        state->ip = rte_be_to_cpu_32(generator_state->knobs.ftuple1.src_ip);
         state->counter = 0;
         state->timestamp = get_time_ns();
         state->phase = 0;
-        state->knobs.n1 *= queue_total;
-        state->knobs.n2 *= queue_total;
-        state->p = state->knobs.n1;
+        generator_state->knobs.n1 *= queue_total;
+        generator_state->knobs.n2 *= queue_total;
+        state->p = generator_state->knobs.n1;
     }
     /* Get state from args */
     else {
-        state = args;
+        state = generator_state->args;
     }
 
-    if (state->counter > state->knobs.n4) {
+    if (state->counter > generator_state->knobs.n4) {
         state->counter = 0;
     }
 
     /* Update 5-tuple values */
-    state->knobs.ftuple1.src_ip = rte_cpu_to_be_32(state->ip + state->counter);
+    generator_state->knobs.ftuple1.src_ip =
+        rte_cpu_to_be_32(state->ip + state->counter);
 
     /* Change phase? */
-    if (get_time_ns() - state->timestamp >= state->knobs.n3) {
+    if (get_time_ns() - state->timestamp >= generator_state->knobs.n3) {
         state->phase = !state->phase;
         state->timestamp = get_time_ns();
-        state->p = (!state->phase) ? state->knobs.n1 : state->knobs.n2;
+        state->p = (!state->phase) ? generator_state->knobs.n1
+                                   : generator_state->knobs.n2;
     }
 
     /* Choose path by probability */
     /* Output is a pointer to the 5-tuple */
     if (queue_idx < state->p) {
-    	*out = &state->knobs.ftuple1;
-        /* state->knobs.ftuple1.src_port = rte_cpu_to_be_16(1000); */
+    	*out = &generator_state->knobs.ftuple1;
     } else {
-    	*out = &state->knobs.ftuple2;
-        /* state->knobs.ftuple1.src_port = rte_cpu_to_be_16(2000); */
+    	*out = &generator_state->knobs.ftuple2;
     }
 
     /* Update counter */
     state->counter++;
 
     /* Output is a pointer to the 5-tuple */
-    *out = &state->knobs.ftuple1;
+    *out = &generator_state->knobs.ftuple1;
 
-    return state;
+    generator_state->args = state;
+    generator_state->status = GENERATOR_VALID;
 }
 
 /* Callback for pcap_dispatch method called in "generator_policy_pcap" */
@@ -239,11 +227,11 @@ pcap_reader_callback(uint8_t *user,
     state->raw.size = h->caplen;
 }
 
-void*
+void
 generator_policy_pcap(uint64_t pkt_num,
                       uint16_t queue_idx,
                       uint16_t queue_total,
-                      void *args,
+                      struct generator_state *generator_state,
                       void **out)
 {
 
@@ -258,14 +246,8 @@ generator_policy_pcap(uint64_t pkt_num,
         memset(state, 0, sizeof(*state));
 
         /* Initialize values */
-        struct policy_knobs knobs;
         char error[PCAP_ERRBUF_SIZE];
-
-        get_void_arg_bytes(&knobs,
-                           args,
-                           sizeof(struct policy_knobs),
-                           false);
-        state->p = pcap_open_offline(knobs.file1, error);
+        state->p = pcap_open_offline(generator_state->knobs.file1, error);
         if (!state->p) {
             printf("Cannot open PCAP file: %s\n", error);
             exit(EXIT_FAILURE);
@@ -273,7 +255,7 @@ generator_policy_pcap(uint64_t pkt_num,
     }
     /* Get state from args */
     else {
-        state = args;
+        state = generator_state->args;
     }
 
     /* Parse 1 pcaket from PCAP */
@@ -287,19 +269,21 @@ generator_policy_pcap(uint64_t pkt_num,
     /* In case no more packets */
     if (ret != 1) {
         *out = NULL;
+        generator_state->status = GENERATOR_TRY_AGAIN;
     } else {
         /* Return a pointer to raw packet */
         *out = &state->raw;
+        generator_state->status = GENERATOR_VALID;
     }
 
-    return state;
+    generator_state->args = state;
 }
 
-void*
+void
 generator_policy_mapping(uint64_t pkt_num,
                          uint16_t queue_idx,
                          uint16_t queue_total,
-                         void *args,
+                         struct generator_state *generator_state,
                          void **out)
 {
     /* Thread specific state */
@@ -317,17 +301,13 @@ generator_policy_mapping(uint64_t pkt_num,
         memset(state, 0, sizeof(*state));
 
         /* Initialize values */
-        struct policy_knobs knobs;
-        get_void_arg_bytes(&knobs,
-                           args,
-                           sizeof(struct policy_knobs),
-                           false);
-        state->trace_mapping = (struct trace_mapping*)knobs.args;
+        state->trace_mapping =
+            (struct trace_mapping*)generator_state->knobs.args;
         state->idx = queue_idx;
     }
     /* Get state from args */
     else {
-        state = args;
+        state = generator_state->args;
     }
 
     /* Get next 5-tuple */
@@ -339,11 +319,13 @@ generator_policy_mapping(uint64_t pkt_num,
     /* In case no more packets */
     if (retval) {
         *out = NULL;
+        generator_state->status = GENERATOR_TRY_AGAIN;
     }
     /* Output is a pointer to the 5-tuple */
     else {
         *out = (void*)&state->ftuple;
+        generator_state->status = GENERATOR_VALID;
     }
 
-    return state;
+    generator_state->args = state;
 }
