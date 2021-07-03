@@ -10,8 +10,8 @@ sudo whoami
 if [[ ! -d libcommon/bin ]]; then
     echo "Building libcommon..."
     git submodule update --init
-    git -C libcommon checkout 80cbc08b1276efd3bd70b05b9b2cd30c83bc2481
-    make -C libcommon
+    git -C libcommon checkout 30c2a3e749d850a9027d33f289ddd20a89e2c966
+    make -C libcommon 
 fi
 
 # Fetch DPDK repository
@@ -28,7 +28,7 @@ git checkout v19.11.8
 if [[ -d $build_dir ]]; then
     read -p "DPDK build dir exists. Do you want to delete it? [y|N]" ans
     if [[ ! -z $ans || $ans =~ [Yy] ]]; then
-        rm $build_dir
+        rm $build_dir -rf
     fi
 fi
 

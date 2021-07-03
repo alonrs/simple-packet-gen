@@ -269,7 +269,7 @@ signal_sigterm(int signum)
 {
     printf("\n");
     fflush(stdout);
-    thread_sync_set_event(&ts_signal, SIGNAL_STOP, 0);
+    exit(0);
 }
 
 /* Pause on SIGINT */
