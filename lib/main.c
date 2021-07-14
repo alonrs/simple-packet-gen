@@ -96,7 +96,9 @@ static struct arguments app_args[] = {
                                  "timstamps on the packets' payloads. This "
                                  "mode uses only 1 RX/TX queue, regardless of "
                                  "'rxq' and 'txq' parameters."},
-
+{"signal",         0, 0, "0",    "On every state change of the packet "
+                                 "generator, signal SIGUSR1 to PID VALUE and "
+                                 "then wait for an input"},
 /* Print statistics to files, */
 {"latency-stats",  0, 0, NULL,   "(Statistics) Collect latency statistics "
                                  "per 'stats-gap' packets. Save results to "
@@ -225,7 +227,8 @@ static struct worker_settings worker_settings;
 /* Packet generation policy */
 static policy_t policy;
 
-/* Restore state after signal */
+/* Signals, states */
+static pid_t signal_pid = 0;
 struct thread_sync ts_signal;
 enum {
     SIGNAL_RUNNING     = 0,
@@ -341,6 +344,30 @@ register_signals()
     signal(SIGTERM, signal_sigterm);
 }
 
+/* Packet generator state change: signal a custom PID the SIGUSR1 signal and
+ * then wait for further instructions */
+static void
+state_change_signal_pid() {
+    int retval;
+    if (!signal_pid) { 
+        return;
+    }
+    retval = kill(signal_pid, SIGUSR1);
+    if (retval == EINVAL) {
+        printf("Cannot send signal to PID %d - invalid signal\n",
+               signal_pid);
+    } else if (retval == EPERM) {
+        printf("Cannot send signal to PID %d - I don't have permissions\n",
+               signal_pid);
+    } else if (retval == ESRCH) {
+        printf("Cannot send signal to PID %d - invalid PID\n",
+               signal_pid);
+    } else {
+        printf("Signal sent to PID %d\n", signal_pid);
+        signal_sigint(SIGINT);
+    }
+}
+
 /* Get "policy_knobs" from user */
 static struct policy_knobs
 parse_policy_knobs()
@@ -422,7 +449,9 @@ initialize_settings()
                MAX_BATCH_SIZE);
     }
 
-    /* Do we operate in "ping-pong" mode? */
+    /* Special modes */
+    signal_pid = ARG_INTEGER(app_args, "signal", 0);
+
     if (ARG_BOOL(app_args, "ping-pong", 0)) {
         printf("Operating in ping-pong mode\n");
         tx_settings.tx_queues = 1;
@@ -834,6 +863,8 @@ workers_start_normal()
         rx_workers++;
         worker_settings.rx_leader_core_id = rte_lcore_id();
     }
+
+    state_change_signal_pid();
 
     /* Start workers on all cores */
     RTE_LCORE_FOREACH_SLAVE(lcore_id) {
