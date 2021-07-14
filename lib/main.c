@@ -295,7 +295,10 @@ signal_sigint(int signum)
     }
     printf(" :");
 
-    ans = getchar();
+    /* Support named pipes */
+    do {
+        ans = getchar();
+    } while (ans == EOF);
     ans = tolower(ans);
 
     switch (ans) {
@@ -308,7 +311,9 @@ signal_sigint(int signum)
     case 't':
         do {
             printf("%s", "Enter new rate in Kpps: ");
-            retval = scanf("%d", &rate);
+            do {
+                retval = scanf("%d", &rate);
+            } while (retval == EOF);
         } while (retval != 1);
         initialize_counters();
         printf("Reset with constant TX rate of %d Kpps\n", rate);
@@ -319,7 +324,9 @@ signal_sigint(int signum)
     case 'a':
         do {
             printf("%s", "Enter manual adaptive rate to start from: ");
-            retval = scanf("%d", &rate);
+            do {
+                retval = scanf("%d", &rate);
+            } while (retval == EOF);
         } while (retval != 1);
         printf("Reset with adaptive TX rate %dX\n", rate);
         initialize_counters();
