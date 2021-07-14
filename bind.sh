@@ -1,22 +1,48 @@
 #!/bin/bash
 
-echo "Caching sudo..."
-sudo whoami &>/dev/null
+# Must run this as root
+[[ $EUID -ne 0 ]] && \
+    echo "Please run me as root." && \
+    exit 1
 
-echo "Loading igb_uio module..."
-sudo modprobe uio
-sudo modprobe igb_uio
+# Load DPDK drivers
+modprobe uio
+dpdk_drivers="igb_uio uio_pci_generic"
+dpdk_driver=
+for driver in $dpdk_drivers; do
+    echo -n "Trying to load DPDK driver '$driver'... "
+    if modprobe $driver &>/dev/null; then
+        dpdk_driver=$driver
+        echo "okay"
+        break
+    fi
+    echo "error"
+done
+if [[ -z $dpdk_driver ]]; then
+    echo "Error - cannot load any DPDK driver."
+    exit 1
+fi
 
 echo "Fetching NIC status..."
 
-dpdk_driver=igb_uio
-
-devbind="./dpdk/usertools/dpdk-devbind.py"
+base=$(readlink -f $(dirname $0))
+devbind="$base/dpdk/usertools/dpdk-devbind.py"
 devs=$($devbind --status-dev net)
 pci=$(echo "$devs" | grep -P "^0000:")
 
 pci_kernel=($(echo "$pci" | grep -vF "drv=$dpdk_driver" | cut -d" " -f1))
 pci_dpdk=($(echo "$pci" | grep "drv=$dpdk_driver" | cut -d" " -f1))
+
+# In case there are arguments, bind them to DPDK
+if [[ $# -gt 0 ]]; then
+    for pci in $@; do
+        cmd="$devbind -b $dpdk_driver $pci"
+        echo $cmd
+        eval $cmd 2>/dev/null
+    done
+    exit 0
+fi
+
 
 echo "$devs"
 echo
@@ -33,7 +59,7 @@ if [[ -z $ans || $ans =~ [yY] ]]; then
     
     read -p "> " ans
     for x in $ans; do
-            cmd="sudo $devbind -b $dpdk_driver ${pci_kernel[x]}"
+            cmd="$devbind -b $dpdk_driver ${pci_kernel[x]}"
             echo $cmd
             eval $cmd
     done
@@ -49,7 +75,7 @@ else
     read -p "Enter the Kernel driver name: " kernel_driver
 
     for x in $ans; do
-            cmd="sudo $devbind -b $kernel_driver ${pci_dpdk[x]}"
+            cmd="$devbind -b $kernel_driver ${pci_dpdk[x]}"
             echo $cmd
             eval $cmd
     done
