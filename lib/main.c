@@ -311,6 +311,7 @@ signal_sigint(int signum)
             retval = scanf("%d", &rate);
         } while (retval != 1);
         initialize_counters();
+        printf("Reset with constant TX rate of %d Kpps\n", rate);
         thread_sync_set_event(&ts_signal,
                               SIGNAL_RESTART | SIGNAL_RATELIMITER,
                               rate);
@@ -320,6 +321,7 @@ signal_sigint(int signum)
             printf("%s", "Enter manual adaptive rate to start from: ");
             retval = scanf("%d", &rate);
         } while (retval != 1);
+        printf("Reset with adaptive TX rate %dX\n", rate);
         initialize_counters();
         thread_sync_set_event(&ts_signal,
                               SIGNAL_RESTART | SIGNAL_MULTIPLIER,
@@ -345,7 +347,7 @@ register_signals()
 }
 
 /* Packet generator state change: signal a custom PID the SIGUSR1 signal and
- * then wait for further instructions */
+ * then wait for further instructions. */
 static void
 state_change_signal_pid() {
     int retval;
@@ -1155,25 +1157,49 @@ tx_show_counter(const int socket,
 /* Returns true if the current TX queues should stop */
 static inline bool
 tx_time_limit(const struct worker_settings *worker_settings,
-              int sec_counter,
-              uint64_t packet_counter)
+              int core_id,
+              int *sec_counter,
+              uint64_t *packet_counter)
 {
+    bool stop_tx = false;
+    bool stop = false;
+
     if (worker_settings->time_limit &&
-        sec_counter >= worker_settings->time_limit) {
-        printf("Time limit has reached. Stopping... \n");
-        thread_sync_set_event(&ts_signal, SIGNAL_STOP, 0);
+        *sec_counter >= worker_settings->time_limit) {
+        *sec_counter = 0;
+        stop = true;
     }
 
     if (worker_settings->tx_limit &&
-        sec_counter >= worker_settings->tx_limit) {
-        printf("TX time limit has reached. Stopping TX queues... \n");
-        atomic_store(&tx_running.val, false);
+        *sec_counter >= worker_settings->tx_limit) {
+        *sec_counter = 0;
+        printf("TX time limit has reached.\n");
+        stop_tx = true;
     }
 
     if (worker_settings->packet_limit &&
-        packet_counter >= worker_settings->packet_limit) {
-        printf("TX packet limit %lu has reached. Stopping TX queues... \n",
+        *packet_counter >= worker_settings->packet_limit) {
+        *packet_counter = 0;
+        printf("TX packet limit %lu has reached.\n",
               worker_settings->packet_limit);
+        stop_tx = true;
+    }
+
+    /* No event change */
+    if (!stop && !stop_tx) {
+        return false;
+    }
+
+    /* Lead TX core signal event change */
+    if (signal_pid && core_id == worker_settings->tx_leader_core_id) {
+        state_change_signal_pid();
+        return false;
+    }
+    /* No signal for event change, act automatically */
+    else if (!signal_pid && stop_tx) {
+        return true;
+    } else if (!signal_pid && stop) {
+        atomic_store(&tx_running.val, false);
         return true;
     }
 
@@ -1498,8 +1524,13 @@ lcore_tx_worker(void *arg)
                                   args,
                                   worker_settings.batch_size,
                                   worker_settings.tx_queue_num);
+                adaptive_speed_set(0);
             }
             if (code & SIGNAL_MULTIPLIER) {
+                rate_limiter_init(&rate_limiter,
+                                  0,
+                                  worker_settings.batch_size,
+                                  worker_settings.tx_queue_num);
                 adaptive_speed_set(args);
             }
             /* Release all other threads */
@@ -1543,7 +1574,10 @@ lcore_tx_worker(void *arg)
         rate_limiter_wait(&rate_limiter);
 
         /* Time limit */
-        if (tx_time_limit(&worker_settings, sec_counter, pkt_counter)) {
+        if (tx_time_limit(&worker_settings,
+                          core,
+                          &sec_counter,
+                          &pkt_counter)) {
             break;
         }
     }
