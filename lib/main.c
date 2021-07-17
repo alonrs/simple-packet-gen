@@ -282,6 +282,8 @@ signal_sigint(int signum)
     int retval;
     int rate;
     char ans;
+    char buf[256];
+    char *ptr;
 
     signal(SIGINT, signal_sigterm);
     thread_sync_set_event(&ts_signal, SIGNAL_PAUSE, 0);
@@ -289,7 +291,7 @@ signal_sigint(int signum)
     ask_again:
     printf("\rWhat would you wish to do? "
            "Continue [C]; Stop [S]; Reset with rate limiter [T]; "
-           "Restart [R]");
+           "Restart [R]; Echo [E]");
     if (policy == POLICY_MAPPING) {
          printf("; Set adaptive rate multiplier (0 disables adaptive) [A]");
     }
@@ -316,7 +318,7 @@ signal_sigint(int signum)
             } while (retval == EOF);
         } while (retval != 1);
         initialize_counters();
-        printf("Reset with constant TX rate of %d Kpps\n", rate);
+        printf("\nReset with constant TX rate of %d Kpps\n", rate);
         thread_sync_set_event(&ts_signal,
                               SIGNAL_RESTART | SIGNAL_RATELIMITER,
                               rate);
@@ -328,7 +330,7 @@ signal_sigint(int signum)
                 retval = scanf("%d", &rate);
             } while (retval == EOF);
         } while (retval != 1);
-        printf("Reset with adaptive TX rate %dX\n", rate);
+        printf("\nReset with adaptive TX rate %dX\n", rate);
         initialize_counters();
         thread_sync_set_event(&ts_signal,
                               SIGNAL_RESTART | SIGNAL_MULTIPLIER,
@@ -338,6 +340,13 @@ signal_sigint(int signum)
         initialize_counters();
         thread_sync_set_event(&ts_signal, SIGNAL_RESTART, 0);
         break;
+    case 'e':
+        printf("Enter message: ");
+        do {
+            ptr = fgets(buf, sizeof(buf), stdin);
+        } while (!ptr || buf[0] == '\n');
+        printf("%s", buf);
+        goto ask_again;
     default:
         goto ask_again;
     }
