@@ -314,6 +314,7 @@ generator_policy_mapping(uint64_t pkt_num,
     retval = trace_mapping_get_next(state->trace_mapping,
                                     &state->ftuple,
                                     &state->idx,
+                                    queue_idx,
                                     queue_total);
 
     /* In case no more packets */

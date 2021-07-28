@@ -19,7 +19,8 @@ enum {
  * @param num_packets Used if "locality_filename" is NULL, for generating
  * the uniform locality
  * @param num_rules Used if "locality_filename" is NULL, for generating
- * @param num_workers Number of workers to generate the packets
+ * @param num_workers Number of workers that generate packets.
+ * @param enable_bg_workers Genearte packets in background threads.
  * the uniform locality
  * @returns NULL on error
  */
@@ -28,6 +29,7 @@ trace_mapping_init(const char *mapping_filename,
                    const char *timestamp_filename,
                    const char *locality_filename,
                    int num_workers,
+                   bool enable_bg_workers,
                    uint32_t num_packets,
                    uint32_t num_rules);
 
@@ -51,16 +53,18 @@ void trace_mapping_reset(struct trace_mapping *trace_mapping);
 /**
  * @brief Returns the next trace packet. If the trace was loaded using a
  * timestamp file, this method also waits the corresponding inter packet delay.
- * @param idx[in|out] The last index of the retrieved 5-tuple, 0 at the 
+ * @param pkt_idx[in|out] The last index of the retrieved 5-tuple, 0 at the 
  * beginning. Should be unique per TX queue
- * @param txq Number of TX queues
+ * @param txq_ Index of the current TX queue
+ * @param txq_num Number of TX queues
  * @returns One of the trace-mapping status codes.
  */
 int
 trace_mapping_get_next(struct trace_mapping *trace_mapping,
                        struct ftuple *ftuple,
-                       int *idx,
-                       int txq);
+                       int *pkt_idx,
+                       int txq_idx,
+                       int txq_num);
 
 /**
  * @brief Modify the speed multiplier for dynamic packet timestamping.
