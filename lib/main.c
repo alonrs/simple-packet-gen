@@ -287,8 +287,9 @@ signal_sigint(int signum)
 
     signal(SIGINT, signal_sigterm);
     thread_sync_set_event(&ts_signal, SIGNAL_PAUSE, 0);
+    fflush(stdout);
 
-    ask_again:
+ask_again:
     printf("\rWhat would you wish to do? "
            "Continue [C]; Stop [S]; Reset with rate limiter [T]; "
            "Restart [R]; Echo [E]");
@@ -296,7 +297,7 @@ signal_sigint(int signum)
          printf("; Set adaptive rate multiplier (0 disables adaptive) [A]");
     }
     printf(" :");
-
+wait_for_ans:
     /* Support named pipes */
     do {
         ans = getchar();
@@ -347,6 +348,9 @@ signal_sigint(int signum)
         } while (!ptr || buf[0] == '\n');
         printf("%s", buf);
         goto ask_again;
+    case '\n':
+    case '\r':
+        goto wait_for_ans;
     default:
         goto ask_again;
     }
@@ -1164,6 +1168,7 @@ tx_show_counter(const int socket,
     mpps = (double)counter/1e6/diff_ns;
 
     printf("TX %.4lf %s\n", mpps, worker_settings->unit_stats);
+    fflush(stdout);
 
     last_timestamp = get_time_ns();
     (*sec_counter)++;
@@ -1460,6 +1465,7 @@ rx_show_counter(const int core,
            err_counter,
            avg_latency_usec,
            drop_percent);
+    fflush(stdout);
     last_timestamp = get_time_ns();
 }
 
