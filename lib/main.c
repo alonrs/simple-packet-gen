@@ -33,6 +33,11 @@ static int lcore_rx_worker(void *arg);
 
 enum { MAX_EAL_ARGS = 64 };
 
+enum {
+    GENERATOR_STATUS_OKAY = 0,
+    GENERATOR_STATUS_END = 1
+};
+
 /* Passed to worker threads */
 struct worker_settings {
     generator_policy_func_t generator;      /* Packet generator */
@@ -1035,20 +1040,24 @@ tx_allocate_mbufs(struct rte_mempool *rte_mempool,
 
 /* Generate a packet batch acording to "worker_settings", fill "rte_mbufs".
  * The generator state "gen_state" is both read and updated.
- * Method is inline for compiler optimizations with "batch_size" */
-static inline void
+ * Method is inline for compiler optimizations with "batch_size".
+ * Returns values from GENERATOR_STATUS enum */
+static inline int
 tx_generate_batch(struct rte_mbuf **rte_mbufs,
                   struct worker_settings *worker_settings,
                   uint16_t *remaining_packets,
                   uint64_t *packet_counter)
 {
     void *gen_data;
+    int retval;
     int num;
     int i;
     
+    retval = GENERATOR_STATUS_OKAY;
+
     /* Don't generate new packets as long as the last batch still valid */
     if (*remaining_packets) {
-        return;
+        return retval;
     }
 
     num = worker_settings->batch_size;
@@ -1061,7 +1070,13 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
                                    &worker_settings->generator_state,
                                    &gen_data);
 
-        /* No further packets available */
+        /* Generator has reached its limit */
+        if (worker_settings->generator_state.status == GENERATOR_END) {
+            retval = GENERATOR_STATUS_END;
+            break;
+        }
+
+        /* No further packets available, other reasons */
         if ((!gen_data) ||
             (worker_settings->generator_state.status == GENERATOR_TRY_AGAIN)) {
             break;
@@ -1087,6 +1102,7 @@ tx_generate_batch(struct rte_mbuf **rte_mbufs,
     }
 
     *remaining_packets = i;
+    return retval;
 }
 
 /* Sends "batch_size" packet from "rte_mbufs" according to "worker_settings".
@@ -1188,10 +1204,11 @@ tx_show_counter(const int socket,
 
 /* Returns true if the current TX queues should stop */
 static inline bool
-tx_time_limit(const struct worker_settings *worker_settings,
-              int core_id,
-              int *sec_counter,
-              uint64_t *packet_counter)
+tx_event_limit(const struct worker_settings *worker_settings,
+               int core_id,
+               int generator_status,
+               int *sec_counter,
+               uint64_t *packet_counter)
 {
     bool stop_tx = false;
     bool stop = false;
@@ -1214,6 +1231,11 @@ tx_time_limit(const struct worker_settings *worker_settings,
         *packet_counter = 0;
         printf("TX packet limit %lu has reached.\n",
               worker_settings->packet_limit);
+        stop_tx = true;
+    }
+
+    /* Stop TX in case the generator status has reached its end */
+    if (generator_status == GENERATOR_STATUS_END) {
         stop_tx = true;
     }
 
@@ -1497,6 +1519,7 @@ lcore_tx_worker(void *arg)
     uint64_t args;
     int socket, core;
     int sec_counter;
+    int generator_status;
 
     socket = rte_socket_id();
     core = rte_lcore_id();
@@ -1504,6 +1527,7 @@ lcore_tx_worker(void *arg)
     sec_counter = 0;
     remaining_packets_to_send = 0;
     num_of_free_mbufs = 0;
+    generator_status = 0;
 
     get_void_arg_bytes(&worker_settings,
                        arg,
@@ -1547,6 +1571,7 @@ lcore_tx_worker(void *arg)
                 pkt_counter = 0;
                 remaining_packets_to_send = 0;
                 sec_counter = 0;
+                generator_status = 0;
                 /* The leader resets the packet generator */
                 if (retval == THREAD_SYNC_WAIT_LEADER) {
                     reset_packet_generator(&worker_settings);
@@ -1586,10 +1611,10 @@ lcore_tx_worker(void *arg)
         }
 
         /* Fill packets in batch */
-        tx_generate_batch(rte_mbufs,
-                          &worker_settings,
-                          &remaining_packets_to_send,
-                          &pkt_counter);
+        generator_status = tx_generate_batch(rte_mbufs,
+                                             &worker_settings,
+                                             &remaining_packets_to_send,
+                                             &pkt_counter);
 
         retval = tx_send_batch(rte_mbufs,
                                &worker_settings,
@@ -1606,11 +1631,12 @@ lcore_tx_worker(void *arg)
 
         rate_limiter_wait(&rate_limiter);
 
-        /* Time limit */
-        if (tx_time_limit(&worker_settings,
-                          core,
-                          &sec_counter,
-                          &pkt_counter)) {
+        /* Time and other events limit */
+        if (tx_event_limit(&worker_settings,
+                           core,
+                           generator_status,
+                           &sec_counter,
+                           &pkt_counter)) {
             break;
         }
     }

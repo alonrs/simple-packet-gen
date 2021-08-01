@@ -8,7 +8,8 @@ struct trace_mapping;
 /* Trace mapping status codes */
 enum {
     TRACE_MAPPING_VALID = 0,
-    TRACE_MAPPING_TRY_AGAIN
+    TRACE_MAPPING_TRY_AGAIN,
+    TRACE_MAPPING_END
 };
 
 /**

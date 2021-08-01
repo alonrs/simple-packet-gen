@@ -317,10 +317,15 @@ generator_policy_mapping(uint64_t pkt_num,
                                     queue_idx,
                                     queue_total);
 
-    /* In case no more packets */
-    if (retval) {
+    /* No new packet, try again */
+    if (retval == TRACE_MAPPING_TRY_AGAIN) {
         *out = NULL;
         generator_state->status = GENERATOR_TRY_AGAIN;
+    }
+    /* No new packet, end of locality */
+    else if (retval == TRACE_MAPPING_END) {
+        *out = NULL;
+         generator_state->status = GENERATOR_END;
     }
     /* Output is a pointer to the 5-tuple */
     else {

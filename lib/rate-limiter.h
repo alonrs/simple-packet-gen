@@ -39,6 +39,11 @@ rate_limiter_wait(struct rate_limiter *rl)
     current_time_ns = get_time_ns();
     time_per_batch = -rl->current_time + current_time_ns;
     gap_ns = 1e6*((double)rl->batch_size/rl->kpps) - time_per_batch;
+    if (gap_ns > 1e9) {
+        gap_ns = 1e9;
+    } else if (gap_ns < 0) {
+        gap_ns = 0;
+    }
     end_time = get_time_ns() + gap_ns;
 
     /* Busy-wait "gap" usec */

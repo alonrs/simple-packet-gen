@@ -13,7 +13,8 @@ typedef enum {
 /* Indicates the generator status */
 typedef enum {
     GENERATOR_VALID = 0,
-    GENERATOR_TRY_AGAIN
+    GENERATOR_TRY_AGAIN,
+    GENERATOR_END
 } generator_status_t;
 
 /* Generator policy */

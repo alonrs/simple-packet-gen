@@ -491,10 +491,15 @@ trace_mapping_get_next(struct trace_mapping *trace_mapping,
     struct ring *ring;
     uint64_t wait_until;
     uint64_t diff_ts;
+    int retval;
 
     /* Do we generate the packet in here, or in a background thread? */
     if (!trace_mapping->enable_bg_workers) {
-        worker_generate_packet(&trace_mapping->worker_context[txq_idx]);
+        retval = worker_generate_packet(&trace_mapping->worker_context[txq_idx]);
+        /* Got to the end of the mapping */
+        if (retval == WORKER_STATUS_END) {
+            return TRACE_MAPPING_END;
+        }
     }
 
     ring = &trace_mapping->ring[*pkt_idx];
