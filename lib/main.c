@@ -173,10 +173,7 @@ static struct arguments app_args[] = {
                                  "mapping filename (required). 'file2' knob "
                                  "controls the timestamp filename (optional). "
                                  "'file3' knob controls the locality filename "
-                                 "(optional). 'n1' knob controls the number of "
-                                 "background packet generators (set to 0 if "
-                                 "the packet generation should be performed "
-                                 "by the TX queues). If 'file3' knob is "
+                                 "(optional). If 'file3' knob is "
                                  "not set, the mapping would have a uniform "
                                  "locality with 'n2' knob to control the "
                                  "number of packets, and 'n3' knob to control "
@@ -437,8 +434,6 @@ initialize_settings()
 {
     struct trace_mapping *trace_mapping;
     struct policy_knobs policy_knobs;
-    bool enable_bg_threads;
-    int num_workers;
 
     /* Initialize port settings */
     memset(&tx_settings, 0, sizeof(tx_settings));
@@ -555,28 +550,21 @@ initialize_settings()
     case POLICY_MAPPING:
         printf("Using mapping policy.\n");
 
-        /* Do we use background threads? */
-        enable_bg_threads = policy_knobs.n1 ? true : false;
-        num_workers = enable_bg_threads ?
-                      policy_knobs.n1 :
-                      tx_settings.tx_queues;
-
         trace_mapping = trace_mapping_init(policy_knobs.file1,
                                            policy_knobs.file2,
                                            policy_knobs.file3,
-                                           num_workers,
-                                           enable_bg_threads,
                                            policy_knobs.n2,
-                                           policy_knobs.n3);
+                                           policy_knobs.n3,
+                                           tx_settings.tx_queues);
+
         /* Disable adaptive speed setting */
         if (policy_knobs.n4 == 0) {
             trace_mapping_set_multiplier(trace_mapping, 0);
         }
-        trace_mapping_start(trace_mapping);
 
         policy_knobs.args = trace_mapping;
         worker_settings.generator = generator_policy_mapping;
-        worker_settings.generator_mode = GENERATOR_OUT_FTUPLE;
+        worker_settings.generator_mode = GENERATOR_OUT_RAW;
         break;
     case POLICY_SUPERSPREADER:
     default:

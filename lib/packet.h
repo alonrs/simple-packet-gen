@@ -38,6 +38,16 @@ get_port(uint16_t port)
     return rte_cpu_to_be_16(port);
 }
 
+/* Fills data with a single IPV4 packet of "size" bytes with
+ * "ftuple" 5-tuple header info */
+void packet_generate_ftuple_raw(char *data,
+                                struct rte_ether_addr *src_mac,
+                                struct rte_ether_addr *dst_mac,
+                                int size,
+                                bool compute_checksum,
+                                struct ftuple *ftuple,
+                                bool print_packet);
+
 /* Fills "mbuf" with a single IPV4 packet of "size" bytes with
  * "ftuple" 5-tuple header info */
 void packet_generate_ftuple(struct rte_mbuf *mbuf,

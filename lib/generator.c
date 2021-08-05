@@ -289,8 +289,7 @@ generator_policy_mapping(uint64_t pkt_num,
     /* Thread specific state */
     struct {
         struct trace_mapping *trace_mapping;
-        int idx;
-        struct ftuple ftuple;
+        struct raw_packet raw_packet;
     } *state;
     int retval;
 
@@ -303,19 +302,17 @@ generator_policy_mapping(uint64_t pkt_num,
         /* Initialize values */
         state->trace_mapping =
             (struct trace_mapping*)generator_state->knobs.args;
-        state->idx = queue_idx;
+        state->raw_packet.size = PACKET_SIZE;
     }
     /* Get state from args */
     else {
         state = generator_state->args;
     }
 
-    /* Get next 5-tuple */
+    /* Get next packet */
     retval = trace_mapping_get_next(state->trace_mapping,
-                                    &state->ftuple,
-                                    &state->idx,
-                                    queue_idx,
-                                    queue_total);
+                                    (void**)&state->raw_packet.bytes,
+                                    queue_idx);
 
     /* No new packet, try again */
     if (retval == TRACE_MAPPING_TRY_AGAIN) {
@@ -327,9 +324,9 @@ generator_policy_mapping(uint64_t pkt_num,
         *out = NULL;
          generator_state->status = GENERATOR_END;
     }
-    /* Output is a pointer to the 5-tuple */
+    /* Output is a raw packet */
     else {
-        *out = (void*)&state->ftuple;
+        *out = &state->raw_packet;
         generator_state->status = GENERATOR_VALID;
     }
 

@@ -14,10 +14,8 @@
 #include "libcommon/lib/perf.h"
 
 #define NUM_FIELDS  5
-#define RING_SIZE 256
 
-#define RING_ELEMENT_STATUS_EMPTY 0
-#define RING_ELEMENT_STATUS_FULL 1
+#define NUM_WORKERS 8
 
 #define SIGNAL_RUNNING 0
 #define SIGNAL_STOP 1
@@ -41,31 +39,34 @@ struct uniform_locality_args {
     int num_of_rules;
 };
 
+struct packet_data {
+    char data[PACKET_SIZE];
+    int64_t ipg_ms;
+};
+
 struct worker_context {
     struct trace_mapping *trace_mapping;
     struct vector_iterator it_locality;
     struct vector_iterator it_timestamp; 
     int worker_idx;
-    int ring_idx;
+    struct packet_data *mem;
 };
 
-ALIGNED_STRUCT(CACHE_LINE_SIZE, ring) {
-    struct ftuple ftuple;
+struct queue_context {
     uint64_t timestamp;
-    volatile int status;
+    uint64_t idx;
+    struct packet_data *mem;
 };
 
 struct trace_mapping {
     struct worker_context *worker_context;
-    struct ring ring[RING_SIZE];
-    struct thread_sync ts_signal;
-    struct vector *locality;
+    struct queue_context *queue_context;
     struct vector *timestamps;
+    struct vector *locality;
+    struct packet_data *mem;
     struct map *mapping;
-    pthread_t *threads;
-    uint64_t timestamp;
-    int num_workers;
-    int enable_bg_workers;
+    uint64_t num_packets;
+    int queue_num;
     atomic_int speed_multiplier;
 };
 
@@ -206,16 +207,21 @@ trace_mapping_clear(struct trace_mapping *trace_mapping)
 {
     int adaptive;
 
-    trace_mapping->timestamp = 0;
     adaptive = atomic_load(&trace_mapping->speed_multiplier) != 0;
     if (adaptive) {
         atomic_init(&trace_mapping->speed_multiplier, 1000);
     }
+}
 
-    for (int i=0; i<RING_SIZE; i++) {
-        atomic_store(&trace_mapping->ring[i].status,
-                     RING_ELEMENT_STATUS_EMPTY);
-    }
+static void
+allocate_memory(struct trace_mapping *trace_mapping)
+{
+    size_t size;
+
+    size = trace_mapping->num_packets * sizeof(struct packet_data);
+    printf("Allocating %.3lf MB for packet data...\n",
+           (double)size / 1024 / 1024);
+    trace_mapping->mem = xmalloc(size);
 }
 
 static void
@@ -223,29 +229,26 @@ worker_init(struct worker_context *ctx)
 {
     ctx->it_locality = vector_begin(ctx->trace_mapping->locality);
     ctx->it_timestamp = vector_begin(ctx->trace_mapping->timestamps);
-    ctx->ring_idx = ctx->worker_idx;
+    ctx->mem = ctx->trace_mapping->mem;
+
     for (int i=0; i<ctx->worker_idx; i++) {
         vector_iterator_next(&ctx->it_locality);
         vector_iterator_next(&ctx->it_timestamp);
+        ctx->mem++;
     }
 }
 
-/* Returns "enum worker satus" */
+/* Returns 0 on success */
 static int
 worker_generate_packet(struct worker_context *ctx)
 {
+    struct ftuple ftuple;
     struct packet *packet;
-    struct ring *ring;
     long *timestamp;
     long *locality;
     uint32_t hash;
+    bool found;
 
-    ring = &ctx->trace_mapping->ring[ctx->ring_idx];
-    if (ctx->trace_mapping->enable_bg_workers && 
-        ring->status == RING_ELEMENT_STATUS_FULL) {
-        return WORKER_STATUS_FULL;
-    }
-    
     timestamp = vector_iterator_valid(&ctx->it_timestamp) ? 
                 (long*)vector_iterator_get(&ctx->it_timestamp) : 
                 NULL;
@@ -256,31 +259,45 @@ worker_generate_packet(struct worker_context *ctx)
 
     /* Got to the end of the mapping */
     if (!locality) {
-        return WORKER_STATUS_END;
+        return 1;
     }
+
+    found = false;
 
     /* Point to the relevant 5-tuple */
     hash = hash_int(*locality, 0);
     MAP_FOR_EACH_WITH_HASH(packet, node, hash, ctx->trace_mapping->mapping) {
         if (packet->locality == *locality) {
-            ring->ftuple = packet->ftuple;
+            ftuple = packet->ftuple;
+	    found = true;
+            break;
         }
     }
 
-    /* Set additional values, timestamp in nanosec */
-    ring->timestamp = ctx->trace_mapping->speed_multiplier *
-                      (timestamp ? *timestamp : 0);
-    ring->status = RING_ELEMENT_STATUS_FULL;
-
-    /* Continue to the next packet */
-    for (int i=0; i<ctx->trace_mapping->num_workers; i++) {
-        vector_iterator_next(&ctx->it_locality);
-        vector_iterator_next(&ctx->it_timestamp);
+    if (!found) {
+	printf("Error - 5-tuple was not found with locality\n");
+	return 1;
     }
 
-    ctx->ring_idx = (ctx->ring_idx + ctx->trace_mapping->num_workers) &
-                    (RING_SIZE-1);
-    return WORKER_STATUS_SUCCESS;
+    packet_generate_ftuple_raw(ctx->mem->data,
+                               NULL,
+                               NULL,
+                               PACKET_SIZE,
+                               true,
+                               &ftuple,
+                               false);
+
+    /* Set additional values, timestamp in nanosec */
+    ctx->mem->ipg_ms = timestamp ? *timestamp : 0;
+
+    /* Continue to the next packet */
+    for (int i=0; i<NUM_WORKERS; i++) {
+        vector_iterator_next(&ctx->it_locality);
+        vector_iterator_next(&ctx->it_timestamp);
+        ctx->mem++;
+    }
+
+    return 0;
 }
 
 static void*
@@ -288,40 +305,13 @@ worker_start(void *args)
 {
     struct worker_context *ctx;
     uint64_t retval;
+
     ctx = (struct worker_context*)args;
-    thread_sync_register(&ctx->trace_mapping->ts_signal);
+    retval = 0;
 
-    while(1) {
-        /* Parse signal */
-        thread_sync_read_relaxed(&ctx->trace_mapping->ts_signal,
-                                 &retval,
-                                 NULL);
-        if (retval == SIGNAL_STOP) {
-            break;
-        } else if (retval == SIGNAL_RESET) {
-            /* Sync with all workers */
-            retval = thread_sync_full_barrier(&ctx->trace_mapping->ts_signal);
-            if (retval == THREAD_SYNC_WAIT_LEADER) {
-                thread_sync_set_event(&ctx->trace_mapping->ts_signal,
-                                      SIGNAL_RUNNING,
-                                      0);
-                thread_sync_continue(&ctx->trace_mapping->ts_signal);
-            }
-            /* Reset */
-            trace_mapping_clear(ctx->trace_mapping);
-            worker_init(ctx);
-            continue;
-        }
-
+    while(!retval) {
         retval = worker_generate_packet(ctx);
-
-        /* Got to the end of the mapping, pause */
-        if (retval == WORKER_STATUS_END) {
-            usleep(100);
-        }
     };
-
-    thread_sync_unregister(&ctx->trace_mapping->ts_signal);
     pthread_exit(NULL);
 }
 
@@ -333,16 +323,9 @@ trace_mapping_destroy(struct trace_mapping *trace_mapping)
         return;
     }
 
-    if (trace_mapping->threads) {
-        thread_sync_set_event(&trace_mapping->ts_signal, SIGNAL_STOP, 0);
-        for (int i=0; i<trace_mapping->num_workers; i++) {
-            pthread_join(trace_mapping->threads[i], NULL);
-        }
-    }
-    free(trace_mapping->threads);
-
     vector_destroy(trace_mapping->locality);
     vector_destroy(trace_mapping->timestamps);
+    free(trace_mapping->mem);
 
     MAP_FOR_EACH(packet, node, trace_mapping->mapping) {
         free(packet);
@@ -357,15 +340,15 @@ struct trace_mapping*
 trace_mapping_init(const char *mapping_filename,
                    const char *timestamp_filename,
                    const char *locality_filename,
-                   int num_workers,
-                   bool enable_bg_workers,
                    uint32_t num_packets,
-                   uint32_t num_rules)
+                   uint32_t num_rules,
+                   int queue_num)
 {
     struct uniform_locality_args args;
     struct trace_mapping *trace_mapping;
     struct worker_context *ctx;
     pthread_t workers[3];
+    pthread_t generator_workers[NUM_WORKERS];
     char bitmask;
     size_t elems;
 
@@ -377,15 +360,7 @@ trace_mapping_init(const char *mapping_filename,
     memset(trace_mapping, 0, sizeof(*trace_mapping));
     bitmask = 0;
 
-    trace_mapping->threads = malloc(sizeof(pthread_t)*num_workers);
-    trace_mapping->num_workers = num_workers;
-    thread_sync_init(&trace_mapping->ts_signal);
     trace_mapping_clear(trace_mapping);
-
-    if (!trace_mapping->threads) {
-        trace_mapping_destroy(trace_mapping);
-        return NULL;
-    }
 
     if (mapping_filename) {
         printf("Reading mapping from \"%s\"...\n", mapping_filename);
@@ -434,93 +409,51 @@ trace_mapping_init(const char *mapping_filename,
         pthread_join(workers[2], (void**)&trace_mapping->timestamps);
     }
 
-    for (int i=0; i<RING_SIZE; i++) {
-        trace_mapping->ring[i].status = RING_ELEMENT_STATUS_EMPTY;
-    }
-
-    trace_mapping->enable_bg_workers = enable_bg_workers;
+    trace_mapping->num_packets = vector_size(trace_mapping->locality);
+    allocate_memory(trace_mapping);
 
     /* Generate the worker context */
-    elems = sizeof(struct worker_context)*trace_mapping->num_workers;
+    elems = sizeof(struct worker_context)*NUM_WORKERS;
     trace_mapping->worker_context = xmalloc(elems);
-    for (int i=0; i<trace_mapping->num_workers; i++) {
+    for (int i=0; i<NUM_WORKERS; i++) {
         ctx = &trace_mapping->worker_context[i];
         ctx->worker_idx = i;
         ctx->trace_mapping = trace_mapping;
         worker_init(ctx);
+        pthread_create(&generator_workers[i],
+                       NULL,
+                       worker_start,
+                       &trace_mapping->worker_context[i]);
+    }
+
+    printf("Waiting for %d generator workers to generate packet data...\n",
+           NUM_WORKERS);
+
+    for (int i=0; i<NUM_WORKERS; i++) {
+        pthread_join(generator_workers[i], NULL);
+    }
+
+    /* Generate queue context */
+    trace_mapping->queue_num = queue_num;
+    trace_mapping->queue_context = xmalloc(sizeof(struct queue_context) *
+                                           queue_num);
+    for (int i=0; i<queue_num; i++) {
+        trace_mapping->queue_context[i].timestamp = 0;
+        trace_mapping->queue_context[i].idx = i;
+        trace_mapping->queue_context[i].mem = trace_mapping->mem + i;
     }
 
     return trace_mapping;
 }
 
-int
-trace_mapping_start(struct trace_mapping *trace_mapping)
-{
-    if (trace_mapping->enable_bg_workers) {
-        for (int i=0; i<trace_mapping->num_workers; i++) {
-            pthread_create(&trace_mapping->threads[i],
-                           NULL,
-                           worker_start,
-                           &trace_mapping->worker_context[i]);
-        }
-    }
-
-    thread_sync_set_event(&trace_mapping->ts_signal, SIGNAL_RUNNING, 0);
-    return 0;
-}
-
 void
 trace_mapping_reset(struct trace_mapping *trace_mapping)
 {
-    if (trace_mapping->enable_bg_workers) {
-        thread_sync_set_event(&trace_mapping->ts_signal, SIGNAL_RESET, 0);
-    } else {
-        for (int i=0; i<trace_mapping->num_workers; i++) {
-            worker_init(&trace_mapping->worker_context[i]);
-        }
+    for (int i=0; i<trace_mapping->queue_num; i++) {
+        trace_mapping->queue_context[i].timestamp = 0;
+        trace_mapping->queue_context[i].idx = i;
+        trace_mapping->queue_context[i].mem = trace_mapping->mem + i;
     }
-}
-
-int
-trace_mapping_get_next(struct trace_mapping *trace_mapping,
-                       struct ftuple *ftuple,
-                       int *pkt_idx,
-                       int txq_idx,
-                       int txq_num)
-{
-    struct ring *ring;
-    uint64_t wait_until;
-    uint64_t diff_ts;
-    int retval;
-
-    /* Do we generate the packet in here, or in a background thread? */
-    if (!trace_mapping->enable_bg_workers) {
-        retval = worker_generate_packet(&trace_mapping->worker_context[txq_idx]);
-        /* Got to the end of the mapping */
-        if (retval == WORKER_STATUS_END) {
-            return TRACE_MAPPING_END;
-        }
-    }
-
-    ring = &trace_mapping->ring[*pkt_idx];
-    if (ring->status == RING_ELEMENT_STATUS_EMPTY) {
-        return TRACE_MAPPING_TRY_AGAIN;
-    }
-
-    /* Inter packet delays are in micro second */
-    diff_ts = ring->timestamp;
-    wait_until = trace_mapping->timestamp + diff_ts;
-    if (get_time_ns() < wait_until) {
-        return TRACE_MAPPING_TRY_AGAIN;
-    }
-
-    trace_mapping->timestamp = get_time_ns();
-    ring->status = RING_ELEMENT_STATUS_EMPTY;
-
-    *ftuple = ring->ftuple;
-    *pkt_idx = (*pkt_idx+txq_num) & (RING_SIZE-1);
-
-    return TRACE_MAPPING_VALID;
 }
 
 void
@@ -534,5 +467,35 @@ int
 trace_mapping_get_multiplier(struct trace_mapping *trace_mapping)
 {
     return atomic_load(&trace_mapping->speed_multiplier);
+}
+
+int
+trace_mapping_get_next(struct trace_mapping *trace_mapping,
+                       void **data,
+                       int txq_idx)
+{
+    struct queue_context *ctx;
+    uint64_t wait_until;
+    uint64_t diff_ts;
+
+    ctx = &trace_mapping->queue_context[txq_idx];
+
+    if (ctx->idx >= trace_mapping->num_packets) {
+        return TRACE_MAPPING_END;
+    }
+
+    /* Inter packet delays are in micro second */
+    diff_ts = ctx->mem->ipg_ms *
+              ((double)trace_mapping->speed_multiplier / 1000);
+    wait_until = ctx->timestamp + diff_ts;
+    if (get_time_ns() < wait_until) {
+        return TRACE_MAPPING_TRY_AGAIN;
+    }
+
+    ctx->timestamp = get_time_ns();
+    *data = (void*)ctx->mem->data;
+    ctx->mem += trace_mapping->queue_num;
+    ctx->idx += trace_mapping->queue_num;
+    return TRACE_MAPPING_VALID;
 }
 
