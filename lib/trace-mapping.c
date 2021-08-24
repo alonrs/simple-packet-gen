@@ -246,6 +246,7 @@ worker_generate_packet(struct worker_context *ctx)
     struct packet *packet;
     long *timestamp;
     long *locality;
+    long loc;
     uint32_t hash;
     bool found;
 
@@ -265,18 +266,20 @@ worker_generate_packet(struct worker_context *ctx)
     found = false;
 
     /* Point to the relevant 5-tuple */
-    hash = hash_int(*locality, 0);
+    loc = *locality % map_size(ctx->trace_mapping->mapping);
+    hash = hash_int(loc, 0);
     MAP_FOR_EACH_WITH_HASH(packet, node, hash, ctx->trace_mapping->mapping) {
-        if (packet->locality == *locality) {
+        if (packet->locality == loc) {
             ftuple = packet->ftuple;
-	    found = true;
+    	    found = true;
             break;
         }
     }
 
     if (!found) {
-	printf("Error - 5-tuple was not found with locality\n");
-	return 1;
+	    printf("Error - 5-tuple was not found with locality %ld\n",
+               *locality);
+        return 1;
     }
 
     packet_generate_ftuple_raw(ctx->mem->data,
@@ -286,6 +289,7 @@ worker_generate_packet(struct worker_context *ctx)
                                true,
                                &ftuple,
                                false);
+
 
     /* Set additional values, timestamp in nanosec */
     ctx->mem->ipg_ms = timestamp ? *timestamp : 0;
