@@ -10,19 +10,19 @@ sudo whoami
 if [[ ! -d libcommon/bin ]]; then
     echo "Building libcommon..."
     git submodule update --init
-    git -C libcommon checkout 30c2a3e749d850a9027d33f289ddd20a89e2c966
+    git -C libcommon checkout tags/v0.1
     make -C libcommon 
 fi
 
 # Fetch DPDK repository
 if [[ ! -d $dpdk_dir || -z $(ls $dpdk_dir/*) ]]; then
     echo "Fetching DPDK repository from git..."
-    git clone https://dpdk.org/git/dpdk-stable $dpdk_dir
+    git clone https://github.com/DPDK/dpdk.git $dpdk_dir
 fi
 
 # Checkout DPDK version tag
 cd $dpdk_dir
-git checkout v19.11.8
+git checkout v19.11
 
 # Create the DPDK build dir
 if [[ -d $build_dir ]]; then
