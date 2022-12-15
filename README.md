@@ -57,6 +57,9 @@ To start GDB, use `run.sh` with GDB as the first argument.
 # Contributing
 Bug fixes and new generator modes are welcome. To create a new packet generator function, follow the steps in [here](https://github.com/alonrs/simple-dpdk-client/blob/7760dab4bb11c938d7875e7f61a604663575ddb1/lib/generator.h#L35). See existing generator functions in [here](https://github.com/alonrs/simple-dpdk-client/blob/7760dab4bb11c938d7875e7f61a604663575ddb1/lib/generator.c#L34).
 
+# Others
+If you happen to use this tool for an academic paper, please cite *Scaling Open vSwitch with a Computational Cache* (USENIX, NSDI 2022).
+
 # License
 MIT license. See LICENSE.MD for more information.
 
